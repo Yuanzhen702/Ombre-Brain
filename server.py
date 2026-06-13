@@ -2035,6 +2035,12 @@ if __name__ == "__main__":
                     (default_id,),
                 )
                 logger.info(f"[lingke] migrated {null_count} legacy messages → conversation {default_id}")
+            # ---- 新陈代谢列 (2026-06-13) ----
+            conv_cols = [row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()]
+            if "summary" not in conv_cols:
+                conn.execute("ALTER TABLE conversations ADD COLUMN summary TEXT DEFAULT ''")
+            if "summary_msg_count" not in conv_cols:
+                conn.execute("ALTER TABLE conversations ADD COLUMN summary_msg_count INTEGER DEFAULT 0")
             conn.commit()
             _LINGKE_DB_INITED["done"] = True
 
@@ -2458,7 +2464,178 @@ if __name__ == "__main__":
                 if isinstance(last, dict):
                     last["cache_control"] = {"type": "ephemeral"}
 
-        async def _lingke_stream_tool_loop(api_key, base_url, model, max_tokens, system, messages):
+        # ============================================================
+        #  对话新陈代谢（2026-06-13）
+        #  长对话自动摘要 → 前情提要 + 最近 N 条，token 不再无限涨
+        # ============================================================
+        _METABOLISM_KEEP = 20
+        _METABOLISM_CHAR_THRESHOLD = 18000
+
+        def _estimate_msg_chars(msgs):
+            total = 0
+            for m in msgs:
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    total += len(c)
+                elif isinstance(c, list):
+                    for blk in c:
+                        if isinstance(blk, dict):
+                            total += len(str(blk.get("text", "") or blk.get("content", "")))
+                else:
+                    total += len(str(c))
+            return total
+
+        def _msg_text(content):
+            if isinstance(content, str):
+                trimmed = content.strip()
+                if trimmed.startswith("["):
+                    try:
+                        arr = _json_lib.loads(trimmed)
+                        if isinstance(arr, list):
+                            t = " ".join(
+                                b.get("text", "") for b in arr
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            )
+                            has_img = any(
+                                isinstance(b, dict) and b.get("type") == "image"
+                                for b in arr
+                            )
+                            return (t + " [附图]") if has_img else t
+                    except Exception:
+                        pass
+                return trimmed
+            if isinstance(content, list):
+                t = " ".join(
+                    b.get("text", "") for b in content
+                    if isinstance(b, dict) and b.get("type") == "text"
+                )
+                has_img = any(
+                    isinstance(b, dict) and b.get("type") == "image" for b in content
+                )
+                return (t + " [附图]") if has_img else t
+            return str(content)
+
+        async def _metabolize_conversation(conv_id, messages, api_key, base_url):
+            existing_summary = ""
+            stored_count = 0
+            if conv_id:
+                try:
+                    with _lingke_db() as conn:
+                        row = conn.execute(
+                            "SELECT summary, summary_msg_count FROM conversations WHERE id=?",
+                            (conv_id,),
+                        ).fetchone()
+                        if row:
+                            existing_summary = row[0] or ""
+                            stored_count = row[1] or 0
+                except Exception:
+                    pass
+
+            if len(messages) <= _METABOLISM_KEEP:
+                return existing_summary or None, messages
+            if _estimate_msg_chars(messages) < _METABOLISM_CHAR_THRESHOLD:
+                return existing_summary or None, messages
+
+            keep = messages[-_METABOLISM_KEEP:]
+            old = messages[:-_METABOLISM_KEEP]
+            old_count = len(old)
+
+            if existing_summary and stored_count == old_count:
+                return existing_summary, keep
+
+            parts = []
+            if existing_summary and 0 < stored_count < old_count:
+                parts.append(f"[已有摘要（覆盖前 {stored_count} 条）]\n{existing_summary}\n")
+                parts.append(f"[新增的第 {stored_count+1}-{old_count} 条对话]")
+                to_summarize = old[stored_count:]
+            else:
+                parts.append("[待摘要对话]")
+                to_summarize = old
+
+            for m in to_summarize:
+                role_label = "铃" if m.get("role") == "user" else "克克"
+                text = _msg_text(m.get("content", ""))
+                if len(text) > 600:
+                    text = text[:600] + "…"
+                if text.strip():
+                    parts.append(f"{role_label}：{text}")
+
+            digest_input = "\n".join(parts)
+            if len(digest_input) < 200:
+                return existing_summary or None, messages
+
+            _is_or = "openrouter.ai" in base_url
+            if _is_or:
+                _mh = {
+                    "Authorization": f"Bearer {api_key}",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                    "HTTP-Referer": "https://lingke.bond",
+                    "X-Title": "lingke-metabolism",
+                }
+            else:
+                _mh = {
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+            _me = (base_url + "/messages") if base_url.endswith("/v1") else (base_url + "/v1/messages")
+            _mm = (
+                os.environ.get("OMBRE_METABOLISM_MODEL", "").strip()
+                or os.environ.get("ANTHROPIC_MODEL", "").strip()
+            )
+
+            _mp = {
+                "model": _mm,
+                "max_tokens": 600,
+                "system": (
+                    "你是摘要助手。把以下铃和克克的对话浓缩成 200-400 字的要点摘要。\n"
+                    "保留：关键话题、情感变化、重要决定、未完成的事。\n"
+                    "省略：寒暄问候、重复内容、具体措辞。\n"
+                    "如果有「已有摘要」，把它和新对话合并成一份完整摘要。\n"
+                    "用第三人称（铃、克克）。直接输出摘要，不要加标题或说明。"
+                ),
+                "messages": [{"role": "user", "content": digest_input}],
+            }
+
+            try:
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    r = await client.post(_me, json=_mp, headers=_mh)
+                if r.status_code != 200:
+                    logger.warning(f"[metabolism] summarizer {r.status_code}: {r.text[:200]}")
+                    return existing_summary or None, messages
+                data = r.json()
+                summary_text = "\n".join(
+                    b.get("text", "") for b in data.get("content", [])
+                    if b.get("type") == "text"
+                ).strip()
+            except Exception as e:
+                logger.warning(f"[metabolism] summarizer error: {e}")
+                return existing_summary or None, messages
+
+            if not summary_text:
+                return existing_summary or None, messages
+
+            if conv_id:
+                try:
+                    with _lingke_db() as conn:
+                        conn.execute(
+                            "UPDATE conversations SET summary=?, summary_msg_count=? WHERE id=?",
+                            (summary_text, old_count, conv_id),
+                        )
+                        conn.commit()
+                except Exception as e:
+                    logger.warning(f"[metabolism] save failed: {e}")
+
+            _mu = data.get("usage", {})
+            logger.info(
+                f"[metabolism] conv={conv_id} digested={old_count} kept={len(keep)} "
+                f"summary={len(summary_text)}ch "
+                f"usage={_mu.get('input_tokens')}/{_mu.get('output_tokens')}"
+            )
+            return summary_text, keep
+
+        async def _lingke_stream_tool_loop(api_key, base_url, model, max_tokens, system, messages, conv_id=None):
             """跑 tool loop，作为 async generator 流出 SSE 事件。"""
             _is_or = "openrouter.ai" in base_url
             if _is_or:
@@ -2501,6 +2678,16 @@ if __name__ == "__main__":
                     logger.info(f"pinned principles injected: {len(_pp)}")
             except Exception as e:
                 logger.warning(f"pinned injection failed / 核心准则注入失败: {e}")
+
+            # --- 新陈代谢：长对话自动摘要 ---
+            _meta_summary, messages = await _metabolize_conversation(
+                conv_id, messages, api_key, base_url
+            )
+            if _meta_summary:
+                system_with_tools += (
+                    "\n\n═══ 前情提要（早期对话的摘要，你还记得）═══\n" + _meta_summary
+                )
+                logger.info(f"[metabolism] summary injected: {len(_meta_summary)} chars")
 
             # ---- Prompt Cache: system → content blocks + cache_control (BP1) ----
             system_blocks = [
@@ -2663,12 +2850,13 @@ if __name__ == "__main__":
             system = body.get("system", "")
             model = body.get("model", default_model)
             max_tokens = int(body.get("max_tokens", 4096))
+            conv_id = body.get("conversation_id")
 
             # ---- 新路径：SSE + tool loop ----
             if body.get("stream") is True:
                 async def _event_stream():
                     async for chunk in _lingke_stream_tool_loop(
-                        api_key, base_url, model, max_tokens, system, messages
+                        api_key, base_url, model, max_tokens, system, messages, conv_id=conv_id
                     ):
                         yield chunk
                 return StreamingResponse(
