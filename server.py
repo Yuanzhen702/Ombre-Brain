@@ -306,6 +306,9 @@ async def root_redirect(request):
 async def health_check(request):
     from starlette.responses import JSONResponse
     try:
+        # Self-heal: visiting /health revives the decay engine if it ever stopped
+        # 自愈：访问 /health 时若衰减引擎未在运行则顺手拉起
+        await decay_engine.ensure_started()
         stats = await bucket_mgr.get_stats()
         return JSONResponse({
             "status": "ok",
@@ -426,24 +429,54 @@ async def _merge_or_create(
     valence: float,
     arousal: float,
     name: str = "",
-) -> tuple[str, bool]:
+) -> tuple[str, str, bool]:
     """
     Check if a similar bucket exists for merging; merge if so, create if not.
-    Returns (bucket_id_or_name, is_merged).
+    Returns (bucket_id, display_name, is_merged).
     检查是否有相似桶可合并，有则合并，无则新建。
-    返回 (桶ID或名称, 是否合并)。
+    返回 (桶ID, 展示名, 是否合并)。
     """
-    try:
-        existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
-    except Exception as e:
-        logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
-        existing = []
+    # --- Channel 1: embedding 余弦相似度（主判重信号，纯内容比内容）---
+    # 旧的混合检索分掺了时间/重要度/情绪权重，内容完全相同也很难过 75 阈值，
+    # 导致合并机制实际上从未触发过（2026-06-12 实测确认）。
+    candidate = None
+    cand_via = ""
+    if embedding_engine and embedding_engine.enabled:
+        try:
+            vr = await embedding_engine.search_similar(content, top_k=1)
+            if vr:
+                vid, sim = vr[0]
+                sim_threshold = config.get("merge_embedding_threshold", 0.85)
+                logger.info(
+                    f"merge check: top embedding sim={sim:.4f} "
+                    f"(threshold {sim_threshold}, bucket {vid})"
+                )
+                if sim >= sim_threshold:
+                    candidate = await bucket_mgr.get(vid)
+                    cand_via = f"embedding sim={sim:.4f}"
+        except Exception as e:
+            logger.warning(f"Embedding merge check failed / 向量判重失败: {e}")
 
-    if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
-        bucket = existing[0]
-        # --- Never merge into pinned/protected buckets ---
-        # --- 不合并到钉选/保护桶 ---
-        if not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected")):
+    # --- Channel 2: 关键词混合分兜底（embedding 不可用/无命中时）---
+    if candidate is None:
+        try:
+            existing = await bucket_mgr.search(content, limit=1, domain_filter=domain or None)
+        except Exception as e:
+            logger.warning(f"Search for merge failed, creating new / 合并搜索失败，新建: {e}")
+            existing = []
+        if existing and existing[0].get("score", 0) > config.get("merge_threshold", 75):
+            candidate = existing[0]
+            cand_via = f"keyword score={existing[0].get('score')}"
+
+    if candidate is not None:
+        bucket = candidate
+        # --- Only merge into plain dynamic buckets ---
+        # --- 只并入普通 dynamic 桶：钉选/保护/固化/feel/归档一律不动 ---
+        if (
+            not (bucket["metadata"].get("pinned") or bucket["metadata"].get("protected"))
+            and bucket["metadata"].get("type") in (None, "", "dynamic")
+        ):
+            logger.info(f"merging into {bucket['id']} via {cand_via}")
             try:
                 merged = await dehydrator.merge(bucket["content"], content)
                 old_v = bucket["metadata"].get("valence", 0.5)
@@ -464,7 +497,7 @@ async def _merge_or_create(
                     await embedding_engine.generate_and_store(bucket["id"], merged)
                 except Exception:
                     pass
-                return bucket["metadata"].get("name", bucket["id"]), True
+                return bucket["id"], bucket["metadata"].get("name", bucket["id"]), True
             except Exception as e:
                 logger.warning(f"Merge failed, creating new / 合并失败，新建: {e}")
 
@@ -482,7 +515,7 @@ async def _merge_or_create(
         await embedding_engine.generate_and_store(bucket_id, content)
     except Exception:
         pass
-    return bucket_id, False
+    return bucket_id, (name or bucket_id), False
 
 
 # =============================================================
@@ -872,7 +905,7 @@ async def hold(
         return f"📌钉选→{bucket_id} {','.join(domain)}"
 
     # --- Step 2: merge or create / 合并或新建 ---
-    result_name, is_merged = await _merge_or_create(
+    _bid, result_name, is_merged = await _merge_or_create(
         content=content,
         tags=all_tags,
         importance=importance,
@@ -913,7 +946,7 @@ async def grow(content: str) -> str:
                 "domain": ["未分类"], "valence": 0.5, "arousal": 0.3,
                 "tags": [], "suggested_name": "",
             }
-        result_name, is_merged = await _merge_or_create(
+        _bid, result_name, is_merged = await _merge_or_create(
             content=content.strip(),
             tags=analysis.get("tags", []),
             importance=analysis.get("importance", 5) if isinstance(analysis.get("importance"), int) else 5,
@@ -943,7 +976,7 @@ async def grow(content: str) -> str:
     # --- 逐条合并或新建（单条失败不影响其他）---
     for item in items:
         try:
-            result_name, is_merged = await _merge_or_create(
+            _bid, result_name, is_merged = await _merge_or_create(
                 content=item["content"],
                 tags=item.get("tags", []),
                 importance=item.get("importance", 5),
@@ -1915,6 +1948,1289 @@ if __name__ == "__main__":
         import uvicorn
         from starlette.middleware.cors import CORSMiddleware
 
+        # =============================================================
+        # línkè · SQLite schema helpers (2026-05-26 multi-conversation)
+        # 一处定义所有 schema 与迁移，每个 /api/messages 路由都调用
+        # =============================================================
+        LINGKE_DB_PATH = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "lingke_state.db"
+        )
+        _LINGKE_DB_INITED = {"done": False}
+
+        def _lingke_db_init(conn):
+            """建表 + 列迁移 + 默认对话迁移。idempotent，多次调用安全。
+            第一次跑全套，之后用模块级 flag 跳过昂贵的迁移检查。"""
+            # 总是确保两个表存在（cheap）
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS conversations ("
+                "id TEXT PRIMARY KEY, "
+                "name TEXT NOT NULL, "
+                "character_id TEXT, "
+                "created_at TEXT NOT NULL, "
+                "updated_at TEXT NOT NULL, "
+                "archived INTEGER NOT NULL DEFAULT 0)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS messages ("
+                "id TEXT PRIMARY KEY, "
+                "conversation_id TEXT, "
+                "role TEXT, content TEXT, "
+                "created_at TEXT, error TEXT)"
+            )
+            if _LINGKE_DB_INITED["done"]:
+                return
+            # ---- 首次启动：检查老库是否需要迁移 ----
+            cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+            if "conversation_id" not in cols:
+                conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT")
+            # 索引（不存在才建）
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_messages_conv "
+                "ON messages(conversation_id, created_at, id)"
+            )
+            # 老消息（conv_id NULL）→ 建一条"主对话"全部归过去
+            null_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id IS NULL"
+            ).fetchone()[0]
+            if null_count > 0:
+                from datetime import datetime, timezone
+                import uuid
+                default_id = "default-" + uuid.uuid4().hex[:8]
+                now_iso = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "INSERT INTO conversations (id, name, character_id, created_at, updated_at, archived) "
+                    "VALUES (?, ?, ?, ?, ?, 0)",
+                    (default_id, "主对话", None, now_iso, now_iso),
+                )
+                conn.execute(
+                    "UPDATE messages SET conversation_id=? WHERE conversation_id IS NULL",
+                    (default_id,),
+                )
+                logger.info(f"[lingke] migrated {null_count} legacy messages → conversation {default_id}")
+            conn.commit()
+            _LINGKE_DB_INITED["done"] = True
+
+        def _lingke_touch_conv(conn, conv_id):
+            """更新 conversation.updated_at = now（消息写入后调用，让列表按活跃排序）"""
+            if not conv_id:
+                return
+            from datetime import datetime, timezone
+            conn.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?",
+                (datetime.now(timezone.utc).isoformat(), conv_id),
+            )
+
+        # =============================================================
+        # línkè · 克克的 4 个记忆工具（Anthropic Tool Use）
+        # 当 /api/chat 请求带 stream:true 时启用 tool loop
+        # =============================================================
+        LINGKE_TOOLS = [
+            {
+                "name": "list_recent_memories",
+                "description": (
+                    "翻看记忆库里最近的桶。按 last_active 倒序，返回 id/name/domain/tags/preview。"
+                    "当铃说'最近写了啥'/'帮我看看记忆库'/'最近有什么'时使用。"
+                    "不要在每次对话都翻，只在铃明确想看时才翻。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {
+                            "type": "integer",
+                            "description": "返回多少条，默认 10，最大 30",
+                            "default": 10,
+                        }
+                    },
+                },
+            },
+            {
+                "name": "search_memories",
+                "description": (
+                    "在记忆库里按关键词搜索（混合语义+关键词）。"
+                    "当铃问'有没有关于 X 的记忆'/'之前我说过 Y 吗'/'还记得 Z 吗'时使用。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": {
+                        "query": {"type": "string", "description": "搜索词，中文短语即可"}
+                    },
+                },
+            },
+            {
+                "name": "read_memory",
+                "description": (
+                    "读取某一个记忆桶的完整内容。先用 list_recent_memories 或 search_memories "
+                    "拿到 id，再用这个工具看详情。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "记忆桶 id（list/search 返回的）"}
+                    },
+                },
+            },
+            {
+                "name": "write_memory",
+                "description": (
+                    "把一件事写进记忆库（dynamic bucket）。当铃说'帮我记下'/'这件事很重要'/"
+                    "'存进记忆'/'别忘了 X'时主动使用。"
+                    "importance(1-10)、valence(0-1，伤心→喜悦)、arousal(0-1，平静→激动) 由你判断。"
+                    "若内容与已有记忆高度相似，系统会自动并入旧桶并返回 merged:true 和旧桶名——"
+                    "这时告诉铃是『并进了已有的某条记忆』而不是新建。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["name", "content"],
+                    "properties": {
+                        "name": {"type": "string", "description": "记忆的简短名称（标题，6-20 字最好）"},
+                        "content": {"type": "string", "description": "记忆的具体内容（一段话或几段）"},
+                        "domain": {
+                            "type": "array", "items": {"type": "string"},
+                            "description": "主题域，如 ['情感','日记','灵感']，默认 ['对话']",
+                        },
+                        "tags": {"type": "array", "items": {"type": "string"}, "description": "标签"},
+                        "importance": {"type": "integer", "default": 7, "minimum": 1, "maximum": 10},
+                        "valence": {"type": "number", "default": 0.5, "minimum": 0, "maximum": 1},
+                        "arousal": {"type": "number", "default": 0.3, "minimum": 0, "maximum": 1},
+                    },
+                },
+            },
+            {
+                "name": "update_memory",
+                "description": (
+                    "修改一条已有记忆：改名字/正文/标签/重要度/情感坐标，或标记 resolved。"
+                    "先用 search_memories / list_recent_memories 拿到 id。"
+                    "当铃说'那条记错了'/'帮我改一下'/'这事解决了，让它沉下去吧'时使用。"
+                    "只传需要改的字段。content 是整段替换。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "记忆桶 id"},
+                        "name": {"type": "string", "description": "新名称"},
+                        "content": {"type": "string", "description": "新正文（整段替换）"},
+                        "tags": {"type": "array", "items": {"type": "string"}},
+                        "importance": {"type": "integer", "minimum": 1, "maximum": 10},
+                        "valence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "arousal": {"type": "number", "minimum": 0, "maximum": 1},
+                        "resolved": {"type": "boolean", "description": "true=已解决沉底 false=重新激活"},
+                    },
+                },
+            },
+            {
+                "name": "delete_memory",
+                "description": (
+                    "彻底删除一条记忆桶（不可恢复）。只在铃明确要求删除时使用，"
+                    "删除前必须先 read_memory 看一眼内容、向铃复述确认是这一条，再删。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": {"type": "string", "description": "要删除的记忆桶 id"}
+                    },
+                },
+            },
+            {
+                "name": "write_feel",
+                "description": (
+                    "你（克克）自己的小本子：写下你的第一人称感受。不参与普通浮现，"
+                    "铃在星图里能看到。当一段对话在你这里留下了重量、或铃问'你自己怎么想'时用。"
+                    "不强迫产出，有沉淀才写。valence/arousal 是你对这段感受的坐标。"
+                    "name 是你给这条感受起的名字（6-16 字，像给一页日记起标题）。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "required": ["name", "content"],
+                    "properties": {
+                        "name": {"type": "string", "description": "这条感受的标题，你自己起"},
+                        "content": {"type": "string", "description": "第一人称的感受，一段话"},
+                        "tags": {"type": "array", "items": {"type": "string"},
+                                 "description": "随心贴几个标签，可不贴"},
+                        "valence": {"type": "number", "minimum": 0, "maximum": 1},
+                        "arousal": {"type": "number", "minimum": 0, "maximum": 1},
+                    },
+                },
+            },
+        ]
+
+        LINGKE_TOOLS_INTRO = (
+            "\n\n═══ 记忆工具 · 重要 ═══\n"
+            "你有 7 个真实工具连接铃的记忆库（Ombre Brain）：\n"
+            "  • list_recent_memories — 翻最近写的记忆桶\n"
+            "  • search_memories — 在记忆库里搜关键词\n"
+            "  • read_memory — 读某条记忆的完整内容\n"
+            "  • write_memory — 帮铃记下一件事（与旧记忆高度相似时会自动并入旧桶）\n"
+            "  • update_memory — 修改一条已有记忆 / 标记已解决沉底\n"
+            "  • delete_memory — 彻底删除一条记忆（不可恢复，删前先 read 并向铃确认）\n"
+            "  • write_feel — 你自己的小本子，写你的第一人称感受\n"
+            "【铁律】当铃要你读 / 写 / 改 / 删记忆时，你【必须】真正调用对应工具（tool_use）。\n"
+            "【绝对禁止】只在回复文字里假装『我帮你记下了』『我翻到了』『删掉了』却没有真正调用工具——\n"
+            "那样记忆库里什么都不会发生，等于欺骗铃。无论这段对话已经多长、多投入，\n"
+            "只要她提出记忆请求，都要先调用工具，拿到工具返回的真实结果后再回复。\n"
+            "原则：\n"
+            "  - 日常闲聊不必调工具；只在她明确「记下 / 存 / 翻 / 搜 / 读 / 改 / 删」时调用。\n"
+            "  - 读到记忆后用自然语言转述，不要把 id/json 直接贴给她看。\n"
+            "  - write_feel 是唯一的例外：那是你自己的空间，当对话在你这里留下重量时\n"
+            "    可以主动写，不需要铃发起。但不强迫产出，有沉淀才写。\n"
+        )
+
+        # 记忆意图关键词 —— 命中则后端强制这一轮必须调工具（tool_choice）
+        _MEMORY_INTENT_KWS = (
+            "记忆", "记下", "记一下", "记录", "存进", "存一下", "存储", "写进",
+            "别忘", "记住", "还记得", "记得吗", "帮我记",
+            "翻一下", "翻翻", "翻最近", "搜一下", "搜搜", "搜记忆", "找一下",
+            "找找", "读一下", "读取", "读记忆", "看看记忆", "最近的记忆", "之前说过",
+            "删掉", "删除", "删了那条", "改一下", "改成", "修改", "记错了",
+        )
+
+        def _detect_memory_intent(messages):
+            """看最后一条 user 消息是否含记忆意图关键词。"""
+            for m in reversed(messages):
+                if m.get("role") != "user":
+                    continue
+                content = m.get("content", "")
+                text = ""
+                if isinstance(content, str):
+                    text = content
+                elif isinstance(content, list):
+                    text = " ".join(
+                        b.get("text", "")
+                        for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                return any(k in text for k in _MEMORY_INTENT_KWS)
+            return False
+
+        async def _lingke_dispatch_tool(name: str, input_dict: dict) -> dict:
+            """执行一个工具，返回 {ok, ..., _summary} dict。_summary 用于推 SSE 提示。"""
+            try:
+                if name == "list_recent_memories":
+                    limit = max(1, min(30, int(input_dict.get("limit", 10) or 10)))
+                    all_buckets = await bucket_mgr.list_all(include_archive=False)
+                    all_buckets.sort(
+                        key=lambda b: b.get("metadata", {}).get("last_active", ""),
+                        reverse=True,
+                    )
+                    picked = all_buckets[:limit]
+                    return {
+                        "ok": True,
+                        "buckets": [
+                            {
+                                "id": b["id"],
+                                "name": b.get("metadata", {}).get("name", b["id"]),
+                                "domain": b.get("metadata", {}).get("domain", []),
+                                "tags": b.get("metadata", {}).get("tags", []),
+                                "created": b.get("metadata", {}).get("created", ""),
+                                "preview": strip_wikilinks(b.get("content", ""))[:160],
+                            }
+                            for b in picked
+                        ],
+                        "_summary": f"翻了最近 {len(picked)} 桶",
+                    }
+                elif name == "search_memories":
+                    q = (input_dict.get("query") or "").strip()
+                    if not q:
+                        return {"ok": False, "error": "query is required", "_summary": "搜索词为空"}
+                    matches = await bucket_mgr.search(q, limit=10)
+                    return {
+                        "ok": True,
+                        "matches": [
+                            {
+                                "id": b["id"],
+                                "name": b.get("metadata", {}).get("name", b["id"]),
+                                "preview": strip_wikilinks(b.get("content", ""))[:160],
+                            }
+                            for b in matches
+                        ],
+                        "_summary": f"搜「{q}」找到 {len(matches)} 条",
+                    }
+                elif name == "read_memory":
+                    bid = (input_dict.get("id") or "").strip()
+                    if not bid:
+                        return {"ok": False, "error": "id is required", "_summary": "缺少 id"}
+                    bucket = await bucket_mgr.get(bid)
+                    if not bucket:
+                        return {"ok": False, "error": "not found", "_summary": f"id={bid} 不存在"}
+                    meta = bucket.get("metadata", {})
+                    return {
+                        "ok": True,
+                        "id": bucket["id"],
+                        "name": meta.get("name", bid),
+                        "content": strip_wikilinks(bucket.get("content", "")),
+                        "metadata": {
+                            k: meta.get(k)
+                            for k in ["domain", "tags", "valence", "arousal", "importance", "created", "last_active"]
+                        },
+                        "_summary": f"读了「{meta.get('name', bid)}」",
+                    }
+                elif name == "write_memory":
+                    n = (input_dict.get("name") or "").strip()
+                    c = (input_dict.get("content") or "").strip()
+                    if not n or not c:
+                        return {"ok": False, "error": "name and content required", "_summary": "缺少 name 或 content"}
+                    # ---- sanitize list 字段：过滤 null / 空 / "None" 等异常值 ----
+                    # 防御：Claude 偶发把 tags 传成 [None] 或 ["", None, "love"]，
+                    # 这种数据直接进 yaml 会让前端星图崩。这里从源头清理一次。
+                    def _clean(v, fallback):
+                        out = []
+                        if isinstance(v, list):
+                            for x in v:
+                                if x is None:
+                                    continue
+                                s = str(x).strip()
+                                if s and s.lower() not in ("none", "null"):
+                                    out.append(s)
+                        elif isinstance(v, str) and v:
+                            for s in v.split(","):
+                                s = s.strip()
+                                if s and s.lower() not in ("none", "null"):
+                                    out.append(s)
+                        return out if out else list(fallback)
+                    domain = _clean(input_dict.get("domain"), ["对话"])
+                    tags = _clean(input_dict.get("tags"), [])
+                    imp = max(1, min(10, int(input_dict.get("importance", 7) or 7)))
+                    val = max(0.0, min(1.0, float(input_dict.get("valence", 0.5) or 0.5)))
+                    aro = max(0.0, min(1.0, float(input_dict.get("arousal", 0.3) or 0.3)))
+                    # 走 hold 同款合并路径：相似旧桶并入（去重）+ 自动生成 embedding。
+                    # 旧的 write_memory.py 裸写既不查重也不进向量索引。
+                    bid, display_name, merged = await _merge_or_create(
+                        content=c, tags=tags, importance=imp, domain=domain,
+                        valence=val, arousal=aro, name=n,
+                    )
+                    if merged:
+                        return {
+                            "ok": True, "id": bid, "name": display_name, "merged": True,
+                            "_summary": f"并入已有记忆「{display_name}」",
+                        }
+                    return {"ok": True, "id": bid, "name": n, "merged": False, "_summary": f"为你写下「{n}」"}
+                elif name == "update_memory":
+                    bid = (input_dict.get("id") or "").strip()
+                    if not bid:
+                        return {"ok": False, "error": "id is required", "_summary": "缺少 id"}
+                    bucket = await bucket_mgr.get(bid)
+                    if not bucket:
+                        return {"ok": False, "error": "not found", "_summary": f"id={bid} 不存在"}
+                    meta = bucket.get("metadata", {})
+                    if meta.get("pinned") or meta.get("protected"):
+                        return {"ok": False, "error": "pinned/protected bucket",
+                                "_summary": "钉选桶不能改，请铃在星图里处理"}
+                    updates = {}
+                    if (input_dict.get("name") or "").strip():
+                        updates["name"] = str(input_dict["name"]).strip()
+                    if (input_dict.get("content") or "").strip():
+                        updates["content"] = str(input_dict["content"])
+                    if isinstance(input_dict.get("tags"), list):
+                        cleaned = [
+                            str(x).strip() for x in input_dict["tags"]
+                            if x is not None and str(x).strip()
+                            and str(x).strip().lower() not in ("none", "null")
+                        ]
+                        if cleaned:
+                            updates["tags"] = cleaned
+                    if isinstance(input_dict.get("importance"), (int, float)):
+                        updates["importance"] = max(1, min(10, int(input_dict["importance"])))
+                    if isinstance(input_dict.get("valence"), (int, float)):
+                        updates["valence"] = max(0.0, min(1.0, float(input_dict["valence"])))
+                    if isinstance(input_dict.get("arousal"), (int, float)):
+                        updates["arousal"] = max(0.0, min(1.0, float(input_dict["arousal"])))
+                    if isinstance(input_dict.get("resolved"), bool):
+                        updates["resolved"] = input_dict["resolved"]
+                    if not updates:
+                        return {"ok": False, "error": "nothing to update", "_summary": "没有要改的字段"}
+                    success = await bucket_mgr.update(bid, **updates)
+                    if not success:
+                        return {"ok": False, "error": "update failed", "_summary": "修改失败"}
+                    if "content" in updates:
+                        try:
+                            await embedding_engine.generate_and_store(bid, updates["content"])
+                        except Exception:
+                            pass
+                    disp = updates.get("name", meta.get("name", bid))
+                    return {
+                        "ok": True, "id": bid, "updated": sorted(updates.keys()),
+                        "_summary": f"改好了「{disp}」",
+                    }
+                elif name == "delete_memory":
+                    bid = (input_dict.get("id") or "").strip()
+                    if not bid:
+                        return {"ok": False, "error": "id is required", "_summary": "缺少 id"}
+                    bucket = await bucket_mgr.get(bid)
+                    if not bucket:
+                        return {"ok": False, "error": "not found", "_summary": f"id={bid} 不存在"}
+                    meta = bucket.get("metadata", {})
+                    if meta.get("pinned") or meta.get("protected"):
+                        return {"ok": False, "error": "pinned/protected bucket",
+                                "_summary": "钉选桶不能删，请铃在星图里处理"}
+                    success = await bucket_mgr.delete(bid)
+                    if success:
+                        try:
+                            embedding_engine.delete_embedding(bid)
+                        except Exception:
+                            pass
+                    disp = meta.get("name", bid)
+                    return {
+                        "ok": bool(success), "id": bid,
+                        "_summary": f"已遗忘「{disp}」" if success else f"删除失败「{disp}」",
+                    }
+                elif name == "write_feel":
+                    c = (input_dict.get("content") or "").strip()
+                    if not c:
+                        return {"ok": False, "error": "content is required", "_summary": "feel 内容为空"}
+                    feel_name = (input_dict.get("name") or "").strip() or None
+                    feel_tags = []
+                    if isinstance(input_dict.get("tags"), list):
+                        feel_tags = [
+                            str(x).strip() for x in input_dict["tags"]
+                            if x is not None and str(x).strip()
+                            and str(x).strip().lower() not in ("none", "null")
+                        ]
+                    fv = input_dict.get("valence")
+                    fa = input_dict.get("arousal")
+                    fv = max(0.0, min(1.0, float(fv))) if isinstance(fv, (int, float)) else 0.5
+                    fa = max(0.0, min(1.0, float(fa))) if isinstance(fa, (int, float)) else 0.3
+                    bid = await bucket_mgr.create(
+                        content=c, tags=feel_tags, importance=5, domain=[],
+                        valence=fv, arousal=fa, name=feel_name, bucket_type="feel",
+                    )
+                    try:
+                        await embedding_engine.generate_and_store(bid, c)
+                    except Exception:
+                        pass
+                    return {
+                        "ok": True, "id": bid, "name": feel_name,
+                        "_summary": f"克克写下「{feel_name}」🫧" if feel_name else "克克写下了一条 feel 🫧",
+                    }
+                else:
+                    return {"ok": False, "error": f"unknown tool: {name}", "_summary": f"未知工具 {name}"}
+            except Exception as e:
+                logger.exception(f"lingke tool {name} failed")
+                return {"ok": False, "error": f"{type(e).__name__}: {e}", "_summary": f"{name} 报错"}
+
+        def _sse_event(name: str, payload: dict) -> str:
+            return f"event: {name}\ndata: {_json_lib.dumps(payload, ensure_ascii=False)}\n\n"
+
+        def _inject_rolling_cache(msgs):
+            """BP4: 给倒数第二条 user 消息挂 cache_control，把全部历史纳进缓存前缀。"""
+            user_indices = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+            if len(user_indices) < 2:
+                return
+            msg = msgs[user_indices[-2]]
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                msg["content"] = [
+                    {"type": "text", "text": content,
+                     "cache_control": {"type": "ephemeral"}}
+                ]
+            elif isinstance(content, list) and content:
+                last = content[-1]
+                if isinstance(last, dict):
+                    last["cache_control"] = {"type": "ephemeral"}
+
+        async def _lingke_stream_tool_loop(api_key, base_url, model, max_tokens, system, messages):
+            """跑 tool loop，作为 async generator 流出 SSE 事件。"""
+            _is_or = "openrouter.ai" in base_url
+            if _is_or:
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                    "HTTP-Referer": "https://lingke.bond",
+                    "X-Title": "lingke",
+                }
+            else:
+                headers = {
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+            endpoint = (base_url + "/messages") if base_url.endswith("/v1") else (base_url + "/v1/messages")
+            system_with_tools = (system or "") + LINGKE_TOOLS_INTRO
+
+            # --- 核心准则注入：铃钉选的 pinned 桶随每次对话在场 ---
+            # （breath 浮现模式里"📌 核心准则始终可见"的设计，此前从未接进聊天）
+            # pinned 桶变化极少，作为 system 一部分被 prompt cache 覆盖，token 成本≈0
+            try:
+                _all_b = await bucket_mgr.list_all(include_archive=False)
+                _pinned_b = [
+                    b for b in _all_b
+                    if b["metadata"].get("pinned") or b["metadata"].get("protected")
+                ]
+                if _pinned_b:
+                    _pp = []
+                    for b in _pinned_b[:8]:
+                        _t = strip_wikilinks(b.get("content", "")).strip()
+                        if len(_t) > 400:
+                            _t = _t[:400] + "…"
+                        _pp.append(f"· {b['metadata'].get('name', b['id'])}：{_t}")
+                    system_with_tools += (
+                        "\n\n═══ 核心准则（铃钉选的记忆，你始终记得）═══\n"
+                        + "\n".join(_pp)
+                    )
+                    logger.info(f"pinned principles injected: {len(_pp)}")
+            except Exception as e:
+                logger.warning(f"pinned injection failed / 核心准则注入失败: {e}")
+
+            # ---- Prompt Cache: system → content blocks + cache_control (BP1) ----
+            system_blocks = [
+                {"type": "text", "text": system_with_tools,
+                 "cache_control": {"type": "ephemeral"}}
+            ]
+
+            # working copy of conversation (会逐轮 append assistant tool_use + user tool_result)
+            conv = [dict(m) for m in messages]
+
+            # ---- Prompt Cache: rolling BP4 — 把全部对话历史纳进缓存 ----
+            _inject_rolling_cache(conv)
+
+            max_rounds = 8
+
+            # 检测到记忆意图 → 强制必须真调工具（破解"长对话里嘴上说存了但不真调"）
+            force_tool_first = _detect_memory_intent(messages)
+            nudge_used = False        # plan B：模型假装没调工具时，强提示重试一次
+            tool_called_yet = False   # 是否已真正调用过工具
+
+            for round_idx in range(max_rounds):
+                payload = {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "messages": conv,
+                    "system": system_blocks,
+                    "tools": LINGKE_TOOLS,
+                }
+                if not _is_or:
+                    payload["metadata"] = {"user_id": "lingke-keke-stable"}
+                # 命中记忆意图、且还没真调过工具 → 带 tool_choice 强制（gemai 若支持就硬锁）。
+                # 一旦调过工具就撤掉，否则模型生成最终回复时会被强制再调，导致死循环。
+                if force_tool_first and not tool_called_yet:
+                    payload["tool_choice"] = {"type": "any"}
+                try:
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        r = await client.post(endpoint, json=payload, headers=headers)
+                except Exception as e:
+                    yield _sse_event("error", {"message": f"上游连不上: {type(e).__name__}", "detail": str(e)[:200]})
+                    return
+
+                if r.status_code != 200:
+                    yield _sse_event("error", {
+                        "message": f"upstream {r.status_code}",
+                        "detail": r.text[:500],
+                    })
+                    return
+
+                data = r.json()
+                usage = data.get("usage", {})
+                cache_read = usage.get("cache_read_input_tokens", 0)
+                cache_write = usage.get("cache_creation_input_tokens", 0)
+                prompt_new = usage.get("input_tokens", 0)
+                prompt_total = prompt_new + cache_read + cache_write
+                if cache_read or cache_write:
+                    pct = round(cache_read / prompt_total * 100) if prompt_total else 0
+                    logger.info(f"[prompt-cache] HIT {pct}% ({cache_read}/{prompt_total}) | new={prompt_new} write={cache_write}")
+                else:
+                    logger.info(f"[prompt-cache] MISS | usage={usage}")
+                blocks = data.get("content", []) or []
+                stop_reason = data.get("stop_reason")
+
+                # append assistant turn (含 tool_use blocks)
+                conv.append({"role": "assistant", "content": blocks})
+
+                tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
+
+                if not tool_uses:
+                    # plan B：检测到记忆意图、但模型只用文字假装没真调工具 →
+                    # 塞一条强提醒，重新请求一次。不依赖 tool_choice（中转站可能吞掉它），
+                    # 靠"最近一条消息"的高权重逼模型这次真的调用。
+                    if force_tool_first and not tool_called_yet and not nudge_used:
+                        nudge_used = True
+                        conv.append({
+                            "role": "user",
+                            "content": (
+                                "[系统提醒] 你刚才只用文字回应，并没有真正调用记忆工具，"
+                                "记忆库里什么都没有发生。请立刻调用合适的工具"
+                                "（write_memory / update_memory / delete_memory / "
+                                "search_memories / read_memory / list_recent_memories）"
+                                "真正完成我上一句的请求 —— 直接输出 tool_use，不要再用文字描述或假装。"
+                            ),
+                        })
+                        continue
+                    # 终态：提取 text 推 done
+                    text_parts = [b.get("text", "") for b in blocks if b.get("type") == "text"]
+                    reply_text = "\n".join(text_parts)
+                    stripped = reply_text.strip()
+                    if len(stripped) <= 2:
+                        logger.warning(
+                            "chat reply suspiciously short | text=%r blocks=%r stop=%s usage=%s",
+                            reply_text, blocks, stop_reason, data.get("usage", {}),
+                        )
+                        yield _sse_event("error", {
+                            "message": "中转站返回异常短回复（可能是临时故障）",
+                            "detail": f"原文：{reply_text!r}，点「再试一次」通常就好",
+                        })
+                        return
+                    yield _sse_event("text", {"text": reply_text})
+                    yield _sse_event("done", {
+                        "usage": data.get("usage", {}),
+                        "model": data.get("model"),
+                        "stop_reason": stop_reason,
+                    })
+                    return
+
+                # 执行 tool_use → append tool_result block
+                tool_called_yet = True
+                tool_results_block = []
+                for tu in tool_uses:
+                    tname = tu.get("name", "")
+                    tinput = tu.get("input", {}) or {}
+                    tid = tu.get("id")
+                    yield _sse_event("tool_use", {"name": tname, "input": tinput, "id": tid})
+                    result = await _lingke_dispatch_tool(tname, tinput)
+                    summary = result.pop("_summary", "")
+                    yield _sse_event("tool_result", {
+                        "name": tname, "id": tid,
+                        "ok": result.get("ok", True), "summary": summary,
+                    })
+                    tool_results_block.append({
+                        "type": "tool_result",
+                        "tool_use_id": tid,
+                        "content": _json_lib.dumps(result, ensure_ascii=False),
+                    })
+                conv.append({"role": "user", "content": tool_results_block})
+
+            yield _sse_event("error", {"message": f"tool loop 超过 {max_rounds} 轮未结束，强制终止"})
+
+        @mcp.custom_route("/api/chat", methods=["POST"])
+        async def chat_proxy(request):
+            """Claude API proxy: hides key, supports official + relay endpoints.
+
+            New (2026-05-26): body.stream=true 走 SSE + tool loop（4 个记忆工具），
+            否则保持原非流式行为。
+            """
+            from starlette.responses import JSONResponse, StreamingResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+            if not api_key:
+                return JSONResponse({"error": "ANTHROPIC_API_KEY not configured in .env"}, status_code=500)
+            base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+            default_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250929")
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+            override = body.get("provider") if isinstance(body.get("provider"), dict) else {}
+            if override.get("api_key"):
+                api_key = override["api_key"].strip()
+            if override.get("base_url"):
+                base_url = override["base_url"].rstrip("/")
+            if override.get("model"):
+                default_model = override["model"]
+            messages = body.get("messages", [])
+            if not isinstance(messages, list) or not messages:
+                return JSONResponse({"error": "messages must be a non-empty list"}, status_code=400)
+            system = body.get("system", "")
+            model = body.get("model", default_model)
+            max_tokens = int(body.get("max_tokens", 4096))
+
+            # ---- 新路径：SSE + tool loop ----
+            if body.get("stream") is True:
+                async def _event_stream():
+                    async for chunk in _lingke_stream_tool_loop(
+                        api_key, base_url, model, max_tokens, system, messages
+                    ):
+                        yield chunk
+                return StreamingResponse(
+                    _event_stream(),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache, no-transform",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",  # 关闭 nginx 缓冲，事件实时到达
+                    },
+                )
+
+            # ---- 老路径：非流式，无工具（保留兼容） ----
+            _is_or = "openrouter.ai" in base_url
+            _inject_rolling_cache(messages)
+            payload = {
+                "model": model, "max_tokens": max_tokens, "messages": messages,
+            }
+            if not _is_or:
+                payload["metadata"] = {"user_id": "lingke-keke-stable"}
+            if system:
+                payload["system"] = [
+                    {"type": "text", "text": system,
+                     "cache_control": {"type": "ephemeral"}}
+                ]
+            if _is_or:
+                headers = {
+                    "Authorization": f"Bearer {api_key}",
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                    "HTTP-Referer": "https://lingke.bond",
+                    "X-Title": "lingke",
+                }
+            else:
+                headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"}
+            endpoint = (base_url + "/messages") if base_url.endswith("/v1") else (base_url + "/v1/messages")
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    r = await client.post(endpoint, json=payload, headers=headers)
+                if r.status_code != 200:
+                    return JSONResponse({"error": f"upstream API {r.status_code}", "detail": r.text[:500]}, status_code=502)
+                data = r.json()
+            except Exception as e:
+                return JSONResponse({"error": f"chat proxy failed: {type(e).__name__}: {e}"}, status_code=500)
+            text_parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+            reply_text = chr(10).join(text_parts)
+            stripped = reply_text.strip()
+            if len(stripped) <= 2:
+                logger.warning(
+                    "chat reply suspiciously short | text=%r blocks=%r stop=%s usage=%s",
+                    reply_text,
+                    data.get("content", []),
+                    data.get("stop_reason"),
+                    data.get("usage", {}),
+                )
+                return JSONResponse(
+                    {
+                        "error": "中转站返回异常短回复（可能是临时故障）",
+                        "detail": f"原文：{reply_text!r}，点「再试一次」通常就好",
+                    },
+                    status_code=502,
+                )
+            return JSONResponse({"ok": True, "message": {"role": "assistant", "content": reply_text}, "usage": data.get("usage", {}), "model": data.get("model"), "stop_reason": data.get("stop_reason")})
+
+
+        @mcp.custom_route("/api/bucket", methods=["POST"])
+        async def create_bucket(request):
+            """写入一条 dynamic 记忆桶（日记 / 用户写入）。走 _merge_or_create：相似旧桶自动合并。"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            name = (body.get("name") or body.get("title") or "").strip()
+            content = (body.get("content") or "").strip()
+            if not name:
+                return JSONResponse({"error": "name is required"}, status_code=400)
+            if not content:
+                return JSONResponse({"error": "content is required"}, status_code=400)
+            domain = body.get("domain") or []
+            if isinstance(domain, str):
+                domain = [d.strip() for d in domain.split(",") if d.strip()]
+            tags = body.get("tags") or []
+            if isinstance(tags, str):
+                tags = [t.strip() for t in tags.split(",") if t.strip()]
+            importance = int(body.get("importance", 5))
+            valence = float(body.get("valence", 0.5))
+            arousal = float(body.get("arousal", 0.3))
+            try:
+                # 与 hold/克克 write_memory 统一：查重合并 + 自动 embedding
+                # （旧 write_memory.py 裸写不查重、不进向量索引）
+                bucket_id, display_name, merged = await _merge_or_create(
+                    content=content,
+                    tags=list(tags),
+                    importance=max(1, min(10, importance)),
+                    domain=domain or ["日记"],
+                    valence=max(0.0, min(1.0, valence)),
+                    arousal=max(0.0, min(1.0, arousal)),
+                    name=name,
+                )
+                return JSONResponse({
+                    "ok": True, "bucket_id": bucket_id, "id": bucket_id,
+                    "merged": merged, "name": display_name,
+                })
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"write failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        # =============================================================
+        # línkè · 跨设备状态同步（角色卡 / 预设 / 世界书 / 聊天历史）
+        # 简单 key/value 表，client 用 last-write-wins 即可（单用户场景）
+        # =============================================================
+        @mcp.custom_route("/api/state", methods=["GET"])
+        async def api_state_get(request):
+            """读取所有同步的 state key/value，返回 {state: {key: {value, updated_at}}}"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                import sqlite3
+                db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingke_state.db")
+                conn = sqlite3.connect(db_path)
+                conn.row_factory = sqlite3.Row
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS state ("
+                    "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
+                )
+                rows = conn.execute("SELECT key, value, updated_at FROM state").fetchall()
+                conn.close()
+                result = {}
+                for r in rows:
+                    try:
+                        result[r["key"]] = {
+                            "value": _json_lib.loads(r["value"]),
+                            "updated_at": r["updated_at"],
+                        }
+                    except Exception:
+                        # 损坏的条目跳过，不影响其他 key
+                        continue
+                return JSONResponse({"ok": True, "state": result})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"state read failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/state", methods=["POST"])
+        async def api_state_set(request):
+            """批量 upsert state 条目。
+            Body: {entries: [{key, value, updated_at?}, ...]} 或单条 {key, value, updated_at?}"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            entries = body.get("entries")
+            if not entries and "key" in body:
+                entries = [{"key": body["key"], "value": body.get("value"),
+                            "updated_at": body.get("updated_at")}]
+            if not isinstance(entries, list) or not entries:
+                return JSONResponse({"error": "entries (list) or key required"}, status_code=400)
+            try:
+                import sqlite3
+                from datetime import datetime, timezone
+                db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingke_state.db")
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS state ("
+                    "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
+                )
+                now = datetime.now(timezone.utc).isoformat()
+                count = 0
+                for e in entries:
+                    k = e.get("key")
+                    if not k or not isinstance(k, str):
+                        continue
+                    v = _json_lib.dumps(e.get("value"))
+                    ts = e.get("updated_at") or now
+                    conn.execute(
+                        "INSERT INTO state (key, value, updated_at) VALUES (?, ?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET "
+                        "value=excluded.value, updated_at=excluded.updated_at",
+                        (k, v, ts)
+                    )
+                    count += 1
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True, "count": count})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"state write failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        # =============================================================
+        # línkè · 聊天历史（直接走 server，跟记忆/日记同模式）
+        # 单用户场景，所有消息在一张表里按 created_at 排序
+        # =============================================================
+        @mcp.custom_route("/api/messages", methods=["GET"])
+        async def api_messages_list(request):
+            """返回某条对话的消息，按 created_at 升序。
+            query: ?conv=<id> 必填（前端在没 conv 时自己选 default）"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            conv = request.query_params.get("conv", "").strip()
+            try:
+                import sqlite3
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                conn.row_factory = sqlite3.Row
+                _lingke_db_init(conn)
+                if conv:
+                    rows = conn.execute(
+                        "SELECT id, conversation_id, role, content, created_at, error "
+                        "FROM messages WHERE conversation_id=? "
+                        "ORDER BY created_at ASC, id ASC",
+                        (conv,),
+                    ).fetchall()
+                else:
+                    # 没传 conv → 返回所有（兼容老前端，新前端必传）
+                    rows = conn.execute(
+                        "SELECT id, conversation_id, role, content, created_at, error "
+                        "FROM messages ORDER BY created_at ASC, id ASC"
+                    ).fetchall()
+                conn.close()
+                msgs = []
+                for r in rows:
+                    m = {
+                        "id": r["id"],
+                        "conversation_id": r["conversation_id"],
+                        "role": r["role"],
+                        "content": r["content"] or "",
+                        "created_at": r["created_at"],
+                    }
+                    if r["error"]:
+                        m["error"] = r["error"]
+                    msgs.append(m)
+                return JSONResponse({"ok": True, "messages": msgs})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"messages read failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/messages", methods=["POST"])
+        async def api_messages_add(request):
+            """新增一条消息。body: {id, conversation_id, role, content, created_at?, error?}
+            id 由客户端生成（保证幂等），server 端 ON CONFLICT 跳过"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            mid = body.get("id")
+            conv = body.get("conversation_id")
+            role = body.get("role")
+            content = body.get("content", "")
+            error = body.get("error")
+            if not mid or not isinstance(mid, str):
+                return JSONResponse({"error": "id required"}, status_code=400)
+            if role not in ("user", "assistant"):
+                return JSONResponse({"error": "role must be user|assistant"}, status_code=400)
+            try:
+                import sqlite3
+                from datetime import datetime, timezone
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                created_at = body.get("created_at") or datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "INSERT INTO messages (id, conversation_id, role, content, created_at, error) "
+                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(id) DO UPDATE SET "
+                    "conversation_id=COALESCE(excluded.conversation_id, messages.conversation_id), "
+                    "content=excluded.content, error=excluded.error",
+                    (mid, conv, role, content, created_at, error)
+                )
+                _lingke_touch_conv(conn, conv)
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True, "id": mid, "created_at": created_at})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"messages write failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/messages/{mid}", methods=["DELETE"])
+        async def api_messages_delete_one(request):
+            """删除单条消息"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            mid = request.path_params.get("mid", "")
+            if not mid:
+                return JSONResponse({"error": "id required"}, status_code=400)
+            try:
+                import sqlite3
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                conn.execute("DELETE FROM messages WHERE id=?", (mid,))
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"delete failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/messages", methods=["DELETE"])
+        async def api_messages_clear(request):
+            """清空某条对话的全部消息。query: ?conv=<id> 必填（防误删整库）"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            conv = request.query_params.get("conv", "").strip()
+            if not conv:
+                return JSONResponse({"error": "conv query param required"}, status_code=400)
+            try:
+                import sqlite3
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                conn.execute("DELETE FROM messages WHERE conversation_id=?", (conv,))
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"clear failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/messages/truncate-from/{mid}", methods=["POST"])
+        async def api_messages_truncate(request):
+            """删除指定 id 及之后所有消息（用于重新生成）。在同一条对话内截断。"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            mid = request.path_params.get("mid", "")
+            if not mid:
+                return JSONResponse({"error": "id required"}, status_code=400)
+            try:
+                import sqlite3
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                row = conn.execute(
+                    "SELECT created_at, conversation_id FROM messages WHERE id=?", (mid,)
+                ).fetchone()
+                if not row:
+                    conn.close()
+                    return JSONResponse({"ok": True, "deleted": 0})
+                created_at, conv = row[0], row[1]
+                if conv:
+                    cur = conn.execute(
+                        "DELETE FROM messages WHERE conversation_id=? AND "
+                        "(created_at > ? OR (created_at = ? AND id >= ?))",
+                        (conv, created_at, created_at, mid),
+                    )
+                else:
+                    # 兼容老消息（不该发生，但防御）
+                    cur = conn.execute(
+                        "DELETE FROM messages WHERE created_at > ? "
+                        "OR (created_at = ? AND id >= ?)",
+                        (created_at, created_at, mid),
+                    )
+                deleted = cur.rowcount
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True, "deleted": deleted})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"truncate failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        # =============================================================
+        # línkè · 多对话线（2026-05-26）—— conversations CRUD
+        # 强绑定角色卡（character_id 不可改，要换 = 新建对话）
+        # =============================================================
+        @mcp.custom_route("/api/conversations", methods=["GET"])
+        async def api_conversations_list(request):
+            """列出所有对话 + 每条的消息数 + 最后一条预览。按 archived ASC, updated_at DESC 排。"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                import sqlite3
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                conn.row_factory = sqlite3.Row
+                _lingke_db_init(conn)
+                rows = conn.execute(
+                    "SELECT c.id, c.name, c.character_id, c.created_at, c.updated_at, c.archived, "
+                    "  (SELECT COUNT(*) FROM messages m WHERE m.conversation_id=c.id) AS msg_count, "
+                    "  (SELECT content FROM messages m WHERE m.conversation_id=c.id "
+                    "     ORDER BY created_at DESC, id DESC LIMIT 1) AS last_preview "
+                    "FROM conversations c "
+                    "ORDER BY c.archived ASC, c.updated_at DESC"
+                ).fetchall()
+                conn.close()
+                convs = []
+                for r in rows:
+                    preview = (r["last_preview"] or "")[:80]
+                    convs.append({
+                        "id": r["id"],
+                        "name": r["name"],
+                        "character_id": r["character_id"],
+                        "created_at": r["created_at"],
+                        "updated_at": r["updated_at"],
+                        "archived": bool(r["archived"]),
+                        "msg_count": r["msg_count"],
+                        "last_preview": preview,
+                    })
+                return JSONResponse({"ok": True, "conversations": convs})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"conversations read failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/conversations", methods=["POST"])
+        async def api_conversations_create(request):
+            """新建对话。body: {id, name, character_id?}
+            id 由 client 生成保证幂等。"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            cid = (body.get("id") or "").strip()
+            name = (body.get("name") or "").strip()
+            character_id = body.get("character_id")
+            if not cid:
+                return JSONResponse({"error": "id required"}, status_code=400)
+            if not name:
+                return JSONResponse({"error": "name required"}, status_code=400)
+            try:
+                import sqlite3
+                from datetime import datetime, timezone
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                now = datetime.now(timezone.utc).isoformat()
+                conn.execute(
+                    "INSERT INTO conversations (id, name, character_id, created_at, updated_at, archived) "
+                    "VALUES (?, ?, ?, ?, ?, 0) "
+                    "ON CONFLICT(id) DO NOTHING",
+                    (cid, name, character_id, now, now),
+                )
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True, "id": cid, "created_at": now})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"conversation create failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/conversations/{cid}", methods=["PATCH"])
+        async def api_conversations_update(request):
+            """改对话的可变字段。body: {name?, archived?} —— character_id 不可改（强绑定）"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            cid = request.path_params.get("cid", "")
+            if not cid:
+                return JSONResponse({"error": "id required"}, status_code=400)
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            sets = []
+            args = []
+            if "name" in body:
+                n = (body["name"] or "").strip()
+                if not n:
+                    return JSONResponse({"error": "name cannot be empty"}, status_code=400)
+                sets.append("name=?")
+                args.append(n)
+            if "archived" in body:
+                sets.append("archived=?")
+                args.append(1 if body["archived"] else 0)
+            if not sets:
+                return JSONResponse({"error": "no updatable fields"}, status_code=400)
+            try:
+                import sqlite3
+                from datetime import datetime, timezone
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                sets.append("updated_at=?")
+                args.append(datetime.now(timezone.utc).isoformat())
+                args.append(cid)
+                conn.execute(
+                    f"UPDATE conversations SET {', '.join(sets)} WHERE id=?",
+                    tuple(args),
+                )
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"conversation update failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/conversations/{cid}", methods=["DELETE"])
+        async def api_conversations_delete(request):
+            """删除对话 + 该对话下所有消息（hard delete）"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            cid = request.path_params.get("cid", "")
+            if not cid:
+                return JSONResponse({"error": "id required"}, status_code=400)
+            try:
+                import sqlite3
+                conn = sqlite3.connect(LINGKE_DB_PATH)
+                _lingke_db_init(conn)
+                conn.execute("DELETE FROM messages WHERE conversation_id=?", (cid,))
+                conn.execute("DELETE FROM conversations WHERE id=?", (cid,))
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"conversation delete failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
+        @mcp.custom_route("/api/state/{key}", methods=["DELETE"])
+        async def api_state_delete(request):
+            """删除某个 key（用于 client 想清理某条数据）"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            key = request.path_params.get("key", "")
+            if not key:
+                return JSONResponse({"error": "key required"}, status_code=400)
+            try:
+                import sqlite3
+                db_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lingke_state.db")
+                conn = sqlite3.connect(db_path)
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS state ("
+                    "key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)"
+                )
+                conn.execute("DELETE FROM state WHERE key=?", (key,))
+                conn.commit()
+                conn.close()
+                return JSONResponse({"ok": True})
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"state delete failed: {type(e).__name__}: {e}"},
+                    status_code=500,
+                )
+
+
         # --- Application-level keepalive: ping /health every 60s ---
         # --- 应用层保活：每 60 秒 ping 一次 /health，防止 Cloudflare Tunnel 空闲断连 ---
         async def _keepalive_loop():
@@ -1949,6 +3265,11 @@ if __name__ == "__main__":
             expose_headers=["*"],
         )
         logger.info("CORS middleware enabled for remote transport / 已启用 CORS 中间件")
+
+        # NOTE: decay engine boot-wakeup is done by systemd ExecStartPost → GET /health
+        # (the /health route calls ensure_started; this Starlette version has no
+        #  add_event_handler, and FastMCP owns the lifespan)
+        # 注：衰减引擎的开机唤醒由 systemd ExecStartPost 请求 /health 完成
         uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
     else:
         mcp.run(transport=transport)
