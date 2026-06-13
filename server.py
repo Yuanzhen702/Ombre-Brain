@@ -119,9 +119,34 @@ mcp = FastMCP(
 #
 # Env var OMBRE_DASHBOARD_PASSWORD overrides file-stored password.
 # First visit with no password set → forced setup wizard.
-# Sessions stored in memory (lost on restart, 7-day expiry).
+# Sessions persisted to .sessions.json (survive restart, 7-day expiry).
 # =============================================================
-_sessions: dict[str, float] = {}  # {token: expiry_timestamp}
+_SESSION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sessions.json")
+
+
+def _load_sessions() -> dict:
+    try:
+        if os.path.exists(_SESSION_FILE):
+            with open(_SESSION_FILE, "r") as f:
+                data = _json_lib.load(f)
+                now = time.time()
+                return {k: v for k, v in data.items() if v > now}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_sessions():
+    try:
+        tmp = _SESSION_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _json_lib.dump(_sessions, f)
+        os.replace(tmp, _SESSION_FILE)
+    except Exception:
+        pass
+
+
+_sessions: dict[str, float] = _load_sessions()
 
 
 def _get_auth_file() -> str:
@@ -178,6 +203,7 @@ def _verify_any_password(password: str) -> bool:
 def _create_session() -> str:
     token = secrets.token_urlsafe(32)
     _sessions[token] = time.time() + 86400 * 7  # 7-day expiry
+    _save_sessions()
     return token
 
 
@@ -188,6 +214,7 @@ def _is_authenticated(request) -> bool:
     expiry = _sessions.get(token)
     if expiry is None or time.time() > expiry:
         _sessions.pop(token, None)
+        _save_sessions()
         return False
     return True
 
@@ -284,6 +311,7 @@ async def auth_change_password(request):
         return JSONResponse({"error": "新密码不能少于6位"}, status_code=400)
     _save_password_hash(new_pwd)
     _sessions.clear()
+    _save_sessions()
     token = _create_session()
     resp = JSONResponse({"ok": True})
     resp.set_cookie("ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
