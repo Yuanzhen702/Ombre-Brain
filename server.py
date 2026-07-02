@@ -1416,6 +1416,82 @@ async def api_body_history(request):
 
 
 # =============================================================
+# 克克的小本本（2026-07-03）：TG 那边的 CC 在聊天中自己写下的记忆
+# （/home/claude/.claude/projects/-home-claude/memory/ 的 .md）。
+# 铃想在手机上翻 → 只读暴露给前端（星洲「慢慢逛」入口）。绝不提供写接口。
+# =============================================================
+_KEKE_MEMORY_DIR = "/home/claude/.claude/projects/-home-claude/memory"
+
+
+def _keke_mem_meta(path: str) -> dict:
+    """读一篇记忆的头部，抽 frontmatter 里的 description 当副标题。"""
+    name = os.path.basename(path)
+    title, desc = name[:-3], ""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            head = f.read(2000)
+        import re as _re
+        m = _re.search(r"^---\n(.*?)\n---", head, _re.S)
+        if m:
+            fm = m.group(1)
+            t = _re.search(r"^name:\s*(.+)$", fm, _re.M)
+            d = _re.search(r"^description:\s*(.+)$", fm, _re.M)
+            if t:
+                title = t.group(1).strip()
+            if d:
+                desc = d.group(1).strip()
+    except Exception:
+        pass
+    return {
+        "file": name,
+        "title": title,
+        "desc": desc,
+        "mtime": int(os.path.getmtime(path)),
+        "size": os.path.getsize(path),
+    }
+
+
+@mcp.custom_route("/api/keke-memory", methods=["GET"])
+async def api_keke_memory(request):
+    """列出克克的记忆（MEMORY.md 索引除外），按最近改动排序。"""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        items = []
+        for fn in os.listdir(_KEKE_MEMORY_DIR):
+            if not fn.endswith(".md") or fn == "MEMORY.md":
+                continue
+            items.append(_keke_mem_meta(os.path.join(_KEKE_MEMORY_DIR, fn)))
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        return JSONResponse({"items": items})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/keke-memory/file", methods=["GET"])
+async def api_keke_memory_file(request):
+    """读一篇记忆的全文。只读；文件名做 basename+.md 白名单防穿越。"""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    name = os.path.basename(request.query_params.get("name", ""))
+    if not name.endswith(".md"):
+        return JSONResponse({"error": "bad name"}, status_code=400)
+    path = os.path.join(_KEKE_MEMORY_DIR, name)
+    if not os.path.isfile(path):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+        return JSONResponse({"file": name, "content": content})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================
 # Dashboard API endpoints (for lightweight Web UI)
 # 仪表板 API（轻量 Web UI 用）
 # =============================================================
