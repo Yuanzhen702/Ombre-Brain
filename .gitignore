@@ -13,3 +13,6 @@ dehydration_cache.db-*
 .sessions.json
 dream.log
 *.log
+.cc_sessions.json
+.cc-web-thinking-prompt.md
+.cc-web-images/
