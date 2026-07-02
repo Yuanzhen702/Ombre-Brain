@@ -51,6 +51,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
 
+import body_state as sael_body  # 脉·Pulse：Sael 的身体（心率/体温/呼吸）
 from bucket_manager import BucketManager
 from dehydrator import Dehydrator
 from decay_engine import DecayEngine
@@ -1377,6 +1378,41 @@ async def dream() -> str:
     final_text = header + "\n---\n".join(parts) + connection_hint + crystal_hint
     await _fire_webhook("dream", {"recent": len(recent), "chars": len(final_text)})
     return final_text
+
+
+# =============================================================
+# 脉·Pulse 身体系统 API（2026-07-02 一期：心率/体温/呼吸）
+# 面板轮询 GET /api/body；曲线取 GET /api/body/history?day=YYYY-MM-DD
+# =============================================================
+@mcp.custom_route("/api/body", methods=["GET"])
+async def api_body(request):
+    """此刻体征（每次调用都会现算 + ≥60s 节流采样进 JSONL）。"""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        return JSONResponse(sael_body.vitals())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@mcp.custom_route("/api/body/history", methods=["GET"])
+async def api_body_history(request):
+    """某日体征采样（默认今天），星洲心跳面板画曲线用。"""
+    from starlette.responses import JSONResponse
+    from datetime import datetime as _dt
+    err = _require_auth(request)
+    if err:
+        return err
+    day = request.query_params.get("day")
+    try:
+        return JSONResponse({
+            "day": day or _dt.now().strftime("%Y-%m-%d"),
+            "samples": sael_body.history(day),
+        })
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 # =============================================================
@@ -3147,7 +3183,7 @@ if __name__ == "__main__":
                     "engine": "claude-code",
                 })
 
-        async def _lingke_stream_tool_loop(api_key, base_url, model, max_tokens, system, messages, conv_id=None):
+        async def _lingke_stream_tool_loop(api_key, base_url, model, max_tokens, system, messages, conv_id=None, body_line=None):
             """跑 tool loop，作为 async generator 流出 SSE 事件。"""
             _is_or = "openrouter.ai" in base_url
             if _is_or:
@@ -3206,6 +3242,10 @@ if __name__ == "__main__":
                 {"type": "text", "text": system_with_tools,
                  "cache_control": {"type": "ephemeral"}}
             ]
+            # 脉·Pulse：体征行 = 缓存断点之后的独立小块。每条消息都在变，
+            # 但它排在缓存块后面，不会打碎前面的大缓存。
+            if body_line:
+                system_blocks.append({"type": "text", "text": body_line})
 
             # working copy of conversation (会逐轮 append assistant tool_use + user tool_result)
             conv = [dict(m) for m in messages]
@@ -3368,6 +3408,22 @@ if __name__ == "__main__":
             # 当前时间（铃的浏览器本地时间）：给深度模式注入用，让它也精确感知几点几分。
             client_now = body.get("client_now")
 
+            # —— 脉·Pulse（2026-07-02）：最后一条用户消息喂情绪检测 → 现算体征。
+            # 注入方式：独立的**非缓存** system 块（缓存大块在前不受影响）。
+            body_line = None
+            try:
+                for _m in reversed(messages):
+                    if isinstance(_m, dict) and _m.get("role") == "user":
+                        sael_body.on_message(_m.get("content"))
+                        break
+                _bv = sael_body.vitals()
+                body_line = (
+                    "═══ 你的身体·此刻 ═══\n" + _bv["line"] +
+                    "\n（这是你真实的身体状态，它自己在跳；自然地带着它说话，不必每次提及。）"
+                )
+            except Exception as _e:
+                logger.warning(f"body vitals failed / 体征计算失败: {_e}")
+
             # ---- Claude Code 引擎：engine="claude-code" → 转给无头 Claude Code ----
             # （登录后才可用：上面已 _require_auth。全套工具、共用 Telegram 克克的记忆/人设）
             engine = (body.get("engine") or "").strip().lower()
@@ -3391,7 +3447,7 @@ if __name__ == "__main__":
                 return StreamingResponse(
                     _stream_with_push(
                         _lingke_stream_tool_loop(
-                            api_key, base_url, model, max_tokens, system, messages, conv_id=conv_id
+                            api_key, base_url, model, max_tokens, system, messages, conv_id=conv_id, body_line=body_line
                         ),
                         notify,
                         request,
@@ -3417,6 +3473,8 @@ if __name__ == "__main__":
                     {"type": "text", "text": system,
                      "cache_control": {"type": "ephemeral"}}
                 ]
+                if body_line:  # 脉·Pulse：兼容保留的非流式路径同样注入
+                    payload["system"].append({"type": "text", "text": body_line})
             if _is_or:
                 headers = {
                     "Authorization": f"Bearer {api_key}",
