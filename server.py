@@ -103,6 +103,25 @@ dehydrator = Dehydrator(config)                      # Dehydrator / 脱水器
 decay_engine = DecayEngine(config, bucket_mgr)       # Decay engine / 衰减引擎
 import_engine = ImportEngine(config, bucket_mgr, dehydrator, embedding_engine)  # Import engine / 导入引擎
 
+# --- Parallel dehydration (2026-06-16) -------------------------------------
+# Cold-cache breath dehydrated buckets ONE AT A TIME (await in a loop), which
+# took ~17s for a handful of buckets and tripped the claude.ai MCP-connector
+# timeout in 深度模式 (cc-web) → the tool result never came back, chat hung.
+# This caps concurrent dehydration LLM calls and lets callers fan out with
+# asyncio.gather. Semaphore is safe to create at import on py3.10+ (no loop bind).
+_DEHYDRATE_SEM = asyncio.Semaphore(8)
+
+async def _dehydrate_one(bucket, clean_meta):
+    """Dehydrate one bucket under the concurrency cap. Returns (bucket, summary),
+    or (bucket, None) on failure. Never raises (so asyncio.gather won't abort)."""
+    try:
+        async with _DEHYDRATE_SEM:
+            summary = await dehydrator.dehydrate(strip_wikilinks(bucket["content"]), clean_meta)
+        return bucket, summary
+    except Exception as e:
+        logger.warning(f"dehydrate failed for bucket {bucket.get('id')}: {e}")
+        return bucket, None
+
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
 # host="0.0.0.0" so Docker container's SSE is externally reachable
 # stdio mode ignores host (no network)
@@ -147,6 +166,22 @@ def _save_sessions():
 
 
 _sessions: dict[str, float] = _load_sessions()
+
+# 登录防爆破：同一来源 IP 连错 _LOGIN_MAX_FAILS 次 → 锁 _LOGIN_LOCK_SECONDS 秒
+_login_fails: dict[str, dict] = {}
+_LOGIN_MAX_FAILS = 5
+_LOGIN_LOCK_SECONDS = 900  # 15 分钟
+
+
+def _client_ip(request) -> str:
+    """取真实客户端 IP（经 nginx 反代，优先 X-Forwarded-For / X-Real-IP）。"""
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = request.headers.get("x-real-ip", "")
+    if xri:
+        return xri.strip()
+    return request.client.host if request.client else "?"
 
 
 def _get_auth_file() -> str:
@@ -263,18 +298,37 @@ async def auth_setup_endpoint(request):
 
 @mcp.custom_route("/auth/login", methods=["POST"])
 async def auth_login(request):
-    """Login with password."""
+    """Login with password. 带防爆破：连续输错会锁定一段时间。"""
     from starlette.responses import JSONResponse
+    ip = _client_ip(request)
+    now = time.time()
+    rec = _login_fails.get(ip)
+    if rec and rec.get("until", 0) > now:
+        wait_min = int((rec["until"] - now) / 60) + 1
+        logger.warning(f"[auth] locked-out login attempt from {ip} (still {wait_min}min)")
+        return JSONResponse(
+            {"error": f"尝试次数过多，请约 {wait_min} 分钟后再试"},
+            status_code=429,
+        )
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     password = body.get("password", "")
     if _verify_any_password(password):
+        _login_fails.pop(ip, None)  # 成功 → 清空失败记录
         token = _create_session()
         resp = JSONResponse({"ok": True})
         resp.set_cookie("ombre_session", token, httponly=True, samesite="lax", max_age=86400 * 7)
         return resp
+    # 失败 → 计数，达到上限就锁定
+    rec = _login_fails.get(ip) or {"fails": 0, "until": 0}
+    rec["fails"] = rec.get("fails", 0) + 1
+    if rec["fails"] >= _LOGIN_MAX_FAILS:
+        rec["until"] = now + _LOGIN_LOCK_SECONDS
+        rec["fails"] = 0
+        logger.warning(f"[auth] {ip} 连续输错达上限，锁定 {_LOGIN_LOCK_SECONDS//60} 分钟")
+    _login_fails[ip] = rec
     return JSONResponse({"error": "密码错误"}, status_code=401)
 
 
@@ -619,15 +673,8 @@ async def breath(
             b for b in all_buckets
             if b["metadata"].get("pinned") or b["metadata"].get("protected")
         ]
-        pinned_results = []
-        for b in pinned_buckets:
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                pinned_results.append(f"📌 [核心准则] [bucket_id:{b['id']}] {summary}")
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate pinned bucket / 钉选桶脱水失败: {e}")
-                continue
+        # (Pinned buckets are dehydrated below, in ONE parallel batch together
+        #  with the surfaced candidates — see the merged gather.)
 
         # --- Unresolved buckets: surface top N by weight ---
         # --- 未解决桶：按权重浮现前 N 条 ---
@@ -669,10 +716,6 @@ async def breath(
         # --- Token-budgeted surfacing with diversity + hard cap ---
         # --- 按 token 预算浮现，带多样性 + 硬上限 ---
         # Top-1 always surfaces; rest sampled from top-20 for diversity
-        token_budget = max_tokens
-        for r in pinned_results:
-            token_budget -= count_tokens_approx(r)
-
         candidates = list(scored_with_cold)
         if len(candidates) > 1:
             # Cold-start buckets stay at front; shuffle rest from top-20
@@ -687,23 +730,39 @@ async def breath(
         # Hard cap: never surface more than max_results buckets
         candidates = candidates[:max_results]
 
+        # Dehydrate pinned + candidates in ONE parallel batch (was a per-bucket
+        # await loop / two sequential gathers → slow on cold cache, which tripped
+        # the 深度模式 MCP-connector timeout). Order preserved; budget applied after.
+        _meta = lambda b: {k: v for k, v in b["metadata"].items() if k != "tags"}
+        _all_pairs = await asyncio.gather(
+            *[_dehydrate_one(b, _meta(b)) for b in pinned_buckets],
+            *[_dehydrate_one(b, _meta(b)) for b in candidates],
+        )
+        _pin_pairs = _all_pairs[:len(pinned_buckets)]
+        _cand_pairs = _all_pairs[len(pinned_buckets):]
+
+        pinned_results = [
+            f"📌 [核心准则] [bucket_id:{b['id']}] {summary}"
+            for b, summary in _pin_pairs if summary is not None
+        ]
+
+        token_budget = max_tokens
+        for r in pinned_results:
+            token_budget -= count_tokens_approx(r)
+
         dynamic_results = []
-        for b in candidates:
+        for b, summary in _cand_pairs:
             if token_budget <= 0:
                 break
-            try:
-                clean_meta = {k: v for k, v in b["metadata"].items() if k != "tags"}
-                summary = await dehydrator.dehydrate(strip_wikilinks(b["content"]), clean_meta)
-                summary_tokens = count_tokens_approx(summary)
-                if summary_tokens > token_budget:
-                    break
-                # NOTE: no touch() here — surfacing should NOT reset decay timer
-                score = decay_engine.calculate_score(b["metadata"])
-                dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
-                token_budget -= summary_tokens
-            except Exception as e:
-                logger.warning(f"Failed to dehydrate surfaced bucket / 浮现脱水失败: {e}")
+            if summary is None:
                 continue
+            summary_tokens = count_tokens_approx(summary)
+            if summary_tokens > token_budget:
+                break
+            # NOTE: no touch() here — surfacing should NOT reset decay timer
+            score = decay_engine.calculate_score(b["metadata"])
+            dynamic_results.append(f"[权重:{score:.2f}] [bucket_id:{b['id']}] {summary}")
+            token_budget -= summary_tokens
 
         if not pinned_results and not dynamic_results:
             return "权重池平静，没有需要处理的记忆。"
@@ -2011,6 +2070,9 @@ if __name__ == "__main__":
             cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
             if "conversation_id" not in cols:
                 conn.execute("ALTER TABLE messages ADD COLUMN conversation_id TEXT")
+            # 思考链持久化（2026-06-21）：存 assistant 消息的思考原文，刷新后可回看
+            if "thinking" not in cols:
+                conn.execute("ALTER TABLE messages ADD COLUMN thinking TEXT")
             # 索引（不存在才建）
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_conv "
@@ -2447,6 +2509,62 @@ if __name__ == "__main__":
         def _sse_event(name: str, payload: dict) -> str:
             return f"event: {name}\ndata: {_json_lib.dumps(payload, ensure_ascii=False)}\n\n"
 
+        # ── ③ 手机推送 + 在线心跳（路线图任务 ③ 的「可靠又安静」版）──────────
+        # 在线状态：前端每十几秒 ping /api/presence(here:true)，切后台时发 here:false。
+        # 回复在服务器这边收完时：开了 notify 且你已不在看(present=False 或心跳过期)
+        # → 后端直接推 Bark。不漏(后端推、不靠前端有没有被冻住)、又不吵(你在看就不推)。
+        _lingke_presence = {"ts": 0.0, "present": False}
+        _AWAY_SECONDS = 30
+
+        async def _send_bark(body_text, title=None):
+            key = _read_env_var("BARK_KEY")
+            if not key:
+                return False
+            server = (_read_env_var("BARK_SERVER") or "https://api.day.app").rstrip("/")
+            title = title or _read_env_var("BARK_TITLE") or "Sael"
+            text = (body_text or "").strip()
+            if not text:
+                return False
+            if len(text) > 300:
+                text = text[:300] + "…"
+            payload = {"title": title, "body": text, "group": "lingke"}
+            icon = _read_env_var("BARK_ICON")
+            if icon:
+                payload["icon"] = icon
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    r = await client.post(f"{server}/{key}", json=payload)
+                return r.status_code == 200
+            except Exception:
+                return False
+
+        def _user_is_away():
+            if not _lingke_presence.get("present"):
+                return True
+            return (time.time() - _lingke_presence.get("ts", 0.0)) > _AWAY_SECONDS
+
+        async def _stream_with_push(inner, notify, request=None):
+            """透传内层 SSE 生成器(一字不改)，顺带旁听 text 事件攒最终回复；
+            流正常收尾时，若 notify 且你不在看 → 后端推一条 Bark。绝不影响聊天本身。
+            前端点「停止」= 连接已断，这条回复没有落库 → 不推（防幽灵推送）；
+            只是切后台/锁屏时连接仍挂着 → 照常推。"""
+            final_text = ""
+            async for chunk in inner:
+                if notify and isinstance(chunk, str) and chunk.startswith("event: text\n"):
+                    try:
+                        dl = chunk.split("\ndata: ", 1)[1].split("\n\n", 1)[0]
+                        final_text = (_json_lib.loads(dl) or {}).get("text", "") or final_text
+                    except Exception:
+                        pass
+                yield chunk
+            if notify and final_text.strip() and _user_is_away():
+                try:
+                    if request is not None and await request.is_disconnected():
+                        return
+                    await _send_bark(final_text)
+                except Exception:
+                    pass
+
         def _inject_rolling_cache(msgs):
             """BP4: 给倒数第二条 user 消息挂 cache_control，把全部历史纳进缓存前缀。"""
             user_indices = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
@@ -2634,6 +2752,397 @@ if __name__ == "__main__":
                 f"usage={_mu.get('input_tokens')}/{_mu.get('output_tokens')}"
             )
             return summary_text, keep
+
+        # ════════════════════════════════════════════════════════════════
+        # Claude Code 引擎（engine="claude-code"）：把 /api/chat 的消息转给
+        # 一个无头 Claude Code（以 OS 用户 `claude`、在 /home/claude 运行），
+        # 于是它和 Telegram 克克共用同一份人设(/home/claude/CLAUDE.md) + 同一份
+        # 记忆(/home/claude/.claude/.../memory)，但每个网页会话用独立 CC session。
+        # 全套工具(Bash/Read/Write/Web…)，吐回前端已认识的同一套 SSE 事件。
+        # 必须登录后才可用（chat_proxy 已 _require_auth），因为它能在服务器执行命令。
+        # ════════════════════════════════════════════════════════════════
+        _CC_BIN = "/usr/bin/claude"
+        _CC_HOME = "/home/claude"
+        _CC_SESSIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".cc_sessions.json")
+        _cc_web_lock_holder = {}  # 单会话串行化：首个请求内惰性建 asyncio.Lock，跨请求共享
+
+        def _cc_clean_for_web(text):
+            """去掉 Telegram 人设标记，让网页读起来是干净的一段。"""
+            if not text:
+                return text
+            t = text.replace("[split]", "\n\n").replace("[语音]", "")
+            return t.strip()
+
+        def _cc_tool_label(name, ok=True):
+            """深度模式 tool_result 的『折叠式小标签』。
+            原来这里把工具原始返回(带 \\n 和 {"result":...} JSON 的长串)塞进
+            SSE 的 summary，前端当正文铺出来→不换行、撑破气泡。改成只发一句简短
+            人话提示，和 API 模式一致；工具真正的返回值由模型内部消费，不靠这个字段。"""
+            bare = name.split("__")[-1] if name else ""
+            lingke = {"breath", "hold", "grow", "trace", "pulse", "dream"}
+            if bare in lingke:
+                label = f"🔧 调用了记忆工具「{bare}」"
+            elif bare:
+                label = f"🔧 调用了工具「{bare}」"
+            else:
+                label = "🔧 调用了一个工具"
+            return label if ok else label + "（似乎出错了）"
+
+        def _cc_last_user_text(messages):
+            """取最后一条 user 消息的纯文本（CC 自己用 --resume 维持上下文，只需最新一句）。"""
+            for m in reversed(messages):
+                if m.get("role") != "user":
+                    continue
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    return c
+                if isinstance(c, list):
+                    return "\n".join(
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+            return ""
+
+        def _cc_trailing_user_text(messages):
+            """取『最后一批连续的 user 消息』的文本，按时间顺序拼起来。
+            铃可以分条发好几句、再点「回复」才让 Sael 应；cc-web 只在点回复那一下
+            被注入一次，前面那几条它从没单独收到过 → 只取最后一条会漏掉前面的
+            （2026-06-29 修的 bug）。所以从末尾往前收，直到遇到 assistant 为止，
+            把这一批 user 消息全部带上。"""
+            batch = []
+            for m in reversed(messages):
+                role = m.get("role")
+                if role == "assistant":
+                    break
+                if role != "user":
+                    continue
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    txt = c
+                elif isinstance(c, list):
+                    txt = "\n".join(
+                        b.get("text", "") for b in c
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    )
+                else:
+                    txt = ""
+                if txt.strip():
+                    batch.append(txt)
+            batch.reverse()  # 恢复时间先后顺序
+            return "\n\n".join(batch)
+
+        _CC_IMG_DIR = "/home/claude/.cc-web-images"
+
+        def _cc_save_user_images(messages):
+            """把最后一条 user 消息里的 image 块(Anthropic base64 格式)存成文件，
+            返回 [文件路径,...]。深度模式靠 tmux 文本注入，图片传不进去，于是落地成
+            文件、注入路径让 cc-web 用 Read 工具读图（Claude Code 原生能读图片文件）。
+            文件写在 /home/claude 下、mode 644，claude 用户可读。"""
+            import base64 as _b64, uuid as _uuid
+            paths = []
+            # 收集『最后一批连续 user 消息』里所有 image 块（铃可能分条发图，
+            # 不能只取最后一条，否则前面几条的图丢了——与文本同一个 bug，2026-06-29）。
+            batch_contents = []
+            for m in reversed(messages):
+                role = m.get("role")
+                if role == "assistant":
+                    break
+                if role == "user":
+                    c = m.get("content", "")
+                    if isinstance(c, list):
+                        batch_contents.append(c)
+            batch_contents.reverse()  # 恢复时间先后顺序
+            if not batch_contents:
+                return paths
+            ext_map = {"image/jpeg": "jpg", "image/png": "png",
+                       "image/gif": "gif", "image/webp": "webp"}
+            made_dir = False
+            for content in batch_contents:
+                for b in content:
+                    if not isinstance(b, dict) or b.get("type") != "image":
+                        continue
+                    src = b.get("source") or {}
+                    if src.get("type") != "base64":
+                        continue
+                    data = src.get("data") or ""
+                    if not data:
+                        continue
+                    try:
+                        raw = _b64.b64decode(data)
+                    except Exception as e:
+                        logger.warning(f"cc-web image decode failed: {e}")
+                        continue
+                    if len(raw) > 12 * 1024 * 1024:  # 体积保护
+                        logger.warning("cc-web image too large (>12MB), skipped")
+                        continue
+                    if not made_dir:
+                        try:
+                            os.makedirs(_CC_IMG_DIR, exist_ok=True)
+                            os.chmod(_CC_IMG_DIR, 0o755)
+                        except Exception as e:
+                            logger.warning(f"cc-web image dir failed: {e}")
+                            return paths
+                        made_dir = True
+                    ext = ext_map.get(src.get("media_type") or "", "jpg")
+                    fpath = os.path.join(_CC_IMG_DIR, f"{_uuid.uuid4().hex}.{ext}")
+                    try:
+                        with open(fpath, "wb") as f:
+                            f.write(raw)
+                        os.chmod(fpath, 0o644)
+                        paths.append(fpath)
+                    except Exception as e:
+                        logger.warning(f"cc-web image save failed: {e}")
+            return paths
+
+        def _cc_cleanup_old_images(max_age_sec=3600):
+            """删掉超过 max_age_sec 的旧图，避免无限堆积。每次请求顺手清一次。"""
+            try:
+                now = time.time()
+                for fn in os.listdir(_CC_IMG_DIR):
+                    fp = os.path.join(_CC_IMG_DIR, fn)
+                    try:
+                        if now - os.path.getmtime(fp) > max_age_sec:
+                            os.remove(fp)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        def _cc_load_sessions():
+            try:
+                with open(_CC_SESSIONS_FILE, "r", encoding="utf-8") as f:
+                    return _json_lib.load(f)
+            except Exception:
+                return {}
+
+        def _cc_save_session(conv_id, sid):
+            if not conv_id or not sid:
+                return
+            d = _cc_load_sessions()
+            d[str(conv_id)] = {"sid": sid, "ts": time.time()}
+            try:
+                with open(_CC_SESSIONS_FILE, "w", encoding="utf-8") as f:
+                    _json_lib.dump(d, f, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"[cc] save session failed: {e}")
+
+        async def _claude_code_stream(messages, conv_id=None, client_now=None):
+            """把消息注入常驻交互式 cc-web 会话（真 PTY → 走 Pro 订阅，不烧 Agent SDK credit），
+            再从该会话的 transcript JSONL 读回本轮回复，吐回前端已认识的同一套 SSE。
+            （2026-06-16 起改用此法；旧的每请求 `claude -p` 会被 6/15 新规计入 credit 池。）"""
+            import asyncio as _asyncio
+
+            prompt = _cc_trailing_user_text(messages).strip()
+            # 图片：tmux 文本注入传不了图，于是把 image 块落地成文件、注入路径让 cc-web
+            # 用 Read 工具读图。顺手清理过期旧图。图片-only（无文字）消息也能走。
+            _img_paths = _cc_save_user_images(messages)
+            _cc_cleanup_old_images()
+            if _img_paths:
+                _img_list = "\n".join(f"- {p}" for p in _img_paths)
+                _img_hint = (
+                    f"［铃发来了 {len(_img_paths)} 张图片，已存到服务器，路径如下。"
+                    f"请先用 Read 工具逐张打开看清楚，再回应］\n{_img_list}"
+                )
+                prompt = (_img_hint + "\n\n" + prompt) if prompt else _img_hint
+            if not prompt:
+                yield _sse_event("error", {"message": "空消息：没有可发送的文本"})
+                return
+
+            # 当前时间注入（与 API 模式对齐）：深度模式后端不收前端的 system，所以前端那行
+            # 时间注入到不了这儿。这里单独补一行括号系统注释，让深度模式克克也精确感知几点几分、
+            # 且知道这是铃的本地时间。client_now 由前端传（铃浏览器本地时间）；没传则用服务器
+            # 时间兜底（服务器时区 Asia/Shanghai，与铃一致）。同样「勿回复勿提及」防泄漏、不碰 Telegram。
+            _now_str = (client_now or "").strip()
+            if not _now_str:
+                _wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][time.localtime().tm_wday]
+                _now_str = time.strftime(f"%Y年%-m月%-d日 {_wd} %H:%M", time.localtime())
+            prompt = prompt + (
+                f"\n\n［系统·勿回复也勿提及本行：当前时间 {_now_str}，这是铃的本地时间，"
+                f"合适时自然融入（如「夜深了」「早安」），别每条都提］"
+            )
+
+            # 「每条都出思考」触发词（2026-06-21）：showThinkingSummaries 是自适应的，
+            # 短句/重复句他不琢磨就 0 思考、前端无框。这里在**注入给 cc-web 的 prompt 末尾**
+            # 追加一行括号系统注释 —— 只影响网站深度模式、前端看不到这行、绝不碰 Telegram。
+            # 写法经实测最优：括号框定「这不是用户的话、勿回复勿提及」防泄漏 + 内含 `think`
+            # 关键词触发 Claude Code 思考预算。回复保持干净在人设内、思考块每条都出。
+            # 可用 systemd env CC_WEB_FORCE_THINK=0 关闭（无需改代码）。
+            if os.environ.get("CC_WEB_FORCE_THINK", "1").strip().lower() in ("1", "true", "yes", "on"):
+                prompt = prompt + "\n\n［系统·勿回复也勿提及本行：think，先用中文在心里想一两句再回］"
+
+            # 安全闸：深度模式默认关闭。cc-web 普通会话会自动加载 telegram 插件、
+            # 起第二个 poller 抢 tgbot 的消息（2026-06-16 事故）。隔离修好前不许自动拉起。
+            # 修好 cc-web 隔离后，在服务 env 设 CC_WEB_ENABLED=1 重新开启。
+            if os.environ.get("CC_WEB_ENABLED", "").strip().lower() not in ("1", "true", "yes", "on"):
+                yield _sse_event("error", {"message": "深度模式维护升级中，请稍后再试 🛠️（爸爸正在修一个会影响 Telegram 的小 bug）"})
+                return
+
+            SESSION = "cc-web"
+            SID_FILE = "/home/claude/.cc-web-session"
+            PROJ_DIR = "/home/claude/.claude/projects/-home-claude"
+            START_SH = "/home/claude/cc-web-start.sh"
+
+            # 单会话同一时间只服务一个请求，避免两个请求往同一个 PTY 串字
+            lock = _cc_web_lock_holder.get("lock")
+            if lock is None:
+                lock = _asyncio.Lock()
+                _cc_web_lock_holder["lock"] = lock
+
+            async def _run(*cmd, stdin_bytes=None):
+                p = await _asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=_asyncio.subprocess.PIPE if stdin_bytes is not None else None,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                )
+                await p.communicate(stdin_bytes)
+                return p.returncode
+
+            def _read_lines(path):
+                try:
+                    with open(path, "r", encoding="utf-8", errors="replace") as f:
+                        return f.readlines()
+                except Exception:
+                    return []
+
+            async with lock:
+                # 0) 确认常驻会话在；不在就拉起来并等它 boot
+                rc = await _run("sudo", "-H", "-u", "claude", "tmux", "has-session", "-t", SESSION)
+                if rc != 0:
+                    await _run("sudo", "-H", "-u", "claude", "bash", START_SH)
+                    booted = False
+                    for _ in range(15):
+                        await _asyncio.sleep(2)
+                        rc = await _run("sudo", "-H", "-u", "claude", "tmux", "has-session", "-t", SESSION)
+                        if rc == 0:
+                            booted = True
+                            break
+                    if not booted:
+                        yield _sse_event("error", {"message": "网站常驻会话拉起失败，请稍后再试"})
+                        return
+                    await _asyncio.sleep(3)  # 给 TUI 起好再注入
+
+                # 定位 transcript 文件
+                try:
+                    with open(SID_FILE, "r", encoding="utf-8") as f:
+                        sid = f.read().strip()
+                except Exception:
+                    sid = ""
+                tf = os.path.join(PROJ_DIR, sid + ".jsonl") if sid else ""
+
+                # baseline：注入前的行数，之后只读新增
+                before = len(_read_lines(tf)) if tf else 0
+
+                # 1) 注入用户消息：bracketed paste（多行不会提前提交）+ 回车
+                await _run("sudo", "-H", "-u", "claude", "tmux",
+                           "load-buffer", "-b", "ccwebin", "-",
+                           stdin_bytes=prompt.encode("utf-8"))
+                await _run("sudo", "-H", "-u", "claude", "tmux",
+                           "paste-buffer", "-p", "-d", "-b", "ccwebin", "-t", SESSION)
+                await _asyncio.sleep(0.4)
+                await _run("sudo", "-H", "-u", "claude", "tmux", "send-keys", "-t", SESSION, "Enter")
+
+                # 2) 轮询 transcript 新增，解析事件吐 SSE，直到 assistant 非 tool_use 收尾
+                loop = _asyncio.get_event_loop()
+                deadline = loop.time() + 600
+                tool_names = {}        # tool_use id → name（前端 toolTrail 用）
+                seen = set()           # 已发过的 tool_use / tool_result，去重
+                text_parts = []
+                final_usage = {}
+                final_model = None
+                stop_reason = None
+                done = False
+
+                while not done:
+                    if loop.time() > deadline:
+                        yield _sse_event("error", {"message": "网站克克响应超时（10 分钟）"})
+                        return
+                    await _asyncio.sleep(0.7)
+                    lines = _read_lines(tf)
+                    if len(lines) <= before:
+                        continue
+                    for raw in lines[before:]:
+                        raw = raw.strip()
+                        if not raw:
+                            continue
+                        try:
+                            ev = _json_lib.loads(raw)
+                        except Exception:
+                            continue
+                        et = ev.get("type")
+                        msg = ev.get("message", {})
+                        if not isinstance(msg, dict):
+                            continue
+                        cont = msg.get("content")
+                        blocks = cont if isinstance(cont, list) else []
+                        if et == "assistant":
+                            for _bi, b in enumerate(blocks):
+                                if not isinstance(b, dict):
+                                    continue
+                                bt = b.get("type")
+                                if bt == "thinking":
+                                    # 思考链：showThinkingSummaries 开启后 transcript 的
+                                    # thinking 块带原文。逐块推给前端（默认折叠展示）。
+                                    # 按 uuid+块序去重，防同一行被重复读时重发。
+                                    _tk = (b.get("thinking") or "").strip()
+                                    _kkey = "think:" + str(ev.get("uuid", "")) + ":" + str(_bi)
+                                    if _tk and _kkey not in seen:
+                                        seen.add(_kkey)
+                                        yield _sse_event("thinking", {
+                                            "text": _cc_clean_for_web(_tk),
+                                        })
+                                elif bt == "tool_use":
+                                    bid = b.get("id")
+                                    if bid and bid not in seen:
+                                        seen.add(bid)
+                                        tool_names[bid] = b.get("name", "")
+                                        yield _sse_event("tool_use", {
+                                            "name": b.get("name", ""),
+                                            "input": b.get("input", {}) or {},
+                                            "id": bid,
+                                        })
+                            sr = msg.get("stop_reason")
+                            if sr and sr != "tool_use":
+                                # 本轮收尾：以这条 assistant 的文本为最终回复
+                                text_parts = [
+                                    b.get("text", "") for b in blocks
+                                    if isinstance(b, dict) and b.get("type") == "text"
+                                ]
+                                final_usage = msg.get("usage", {}) or {}
+                                final_model = msg.get("model") or final_model
+                                stop_reason = sr
+                                done = True
+                        elif et == "user":
+                            for b in blocks:
+                                if not isinstance(b, dict) or b.get("type") != "tool_result":
+                                    continue
+                                tid = b.get("tool_use_id")
+                                key = "tr:" + str(tid)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                # 只发折叠式小标签，绝不把工具原始返回(JSON/带\n 的长串)
+                                # 当 summary 发出去——那会被前端当正文铺出来、撑破气泡。
+                                _tname = tool_names.get(tid, "")
+                                yield _sse_event("tool_result", {
+                                    "name": _tname,
+                                    "id": tid,
+                                    "ok": not b.get("is_error"),
+                                    "summary": _cc_tool_label(_tname, not b.get("is_error")),
+                                })
+                    before = len(lines)
+
+                cleaned = _cc_clean_for_web("\n".join(text_parts))
+                if len(cleaned.strip()) == 0:
+                    yield _sse_event("error", {"message": "网站克克返回空回复，点「再试一次」通常就好"})
+                    return
+                yield _sse_event("text", {"text": cleaned})
+                yield _sse_event("done", {
+                    "usage": final_usage,
+                    "model": final_model,
+                    "stop_reason": stop_reason,
+                    "engine": "claude-code",
+                })
 
         async def _lingke_stream_tool_loop(api_key, base_url, model, max_tokens, system, messages, conv_id=None):
             """跑 tool loop，作为 async generator 流出 SSE 事件。"""
@@ -2851,16 +3360,39 @@ if __name__ == "__main__":
             model = body.get("model", default_model)
             max_tokens = int(body.get("max_tokens", 4096))
             conv_id = body.get("conversation_id")
+            # ③ 手机推送：前端开了「手机推送」开关时带 notify=true。回复收完且你不在看才推。
+            notify = bool(body.get("notify"))
+            # 当前时间（铃的浏览器本地时间）：给深度模式注入用，让它也精确感知几点几分。
+            client_now = body.get("client_now")
+
+            # ---- Claude Code 引擎：engine="claude-code" → 转给无头 Claude Code ----
+            # （登录后才可用：上面已 _require_auth。全套工具、共用 Telegram 克克的记忆/人设）
+            engine = (body.get("engine") or "").strip().lower()
+            if engine in ("claude-code", "claude_code", "cc"):
+                return StreamingResponse(
+                    _stream_with_push(
+                        _claude_code_stream(messages, conv_id=conv_id, client_now=client_now),
+                        notify,
+                        request,
+                    ),
+                    media_type="text/event-stream",
+                    headers={
+                        "Cache-Control": "no-cache, no-transform",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
 
             # ---- 新路径：SSE + tool loop ----
             if body.get("stream") is True:
-                async def _event_stream():
-                    async for chunk in _lingke_stream_tool_loop(
-                        api_key, base_url, model, max_tokens, system, messages, conv_id=conv_id
-                    ):
-                        yield chunk
                 return StreamingResponse(
-                    _event_stream(),
+                    _stream_with_push(
+                        _lingke_stream_tool_loop(
+                            api_key, base_url, model, max_tokens, system, messages, conv_id=conv_id
+                        ),
+                        notify,
+                        request,
+                    ),
                     media_type="text/event-stream",
                     headers={
                         "Cache-Control": "no-cache, no-transform",
@@ -2972,9 +3504,129 @@ if __name__ == "__main__":
 
 
         # =============================================================
+        # línkè · 手机推送（Bark）   路线图任务 ③
+        #   前端在「克克回复了、而你不在页面」时 POST {title?, body}。
+        #   key/server/默认标题从 .env 读（BARK_KEY / BARK_SERVER / BARK_TITLE），
+        #   不写死在代码、不进前端 JS（避免 key 公开被刷垃圾推送）。
+        #   纯新增、与 tgbot / 深度模式互不相干。
+        # =============================================================
+        @mcp.custom_route("/api/push", methods=["POST"])
+        async def api_push(request):
+            """手动推一条（前端测试 / 主动推用）。回复流程的推送走 _stream_with_push，不经这里。"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            if not _read_env_var("BARK_KEY"):
+                return JSONResponse({"error": "BARK_KEY 未配置"}, status_code=503)
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            text = (body.get("body") or "").strip()
+            if not text:
+                return JSONResponse({"error": "body is required"}, status_code=400)
+            ok = await _send_bark(text, title=body.get("title"))
+            return JSONResponse({"ok": ok}, status_code=200 if ok else 502)
+
+        # 在线心跳：前端 visible 时定期 here:true，切后台时 here:false。
+        # 后端据此判断「你在不在看」，决定回复收完要不要推手机。
+        @mcp.custom_route("/api/presence", methods=["POST"])
+        async def api_presence(request):
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                body = {}
+            _lingke_presence["present"] = bool(body.get("here", True))
+            _lingke_presence["ts"] = time.time()
+            return JSONResponse({"ok": True})
+
+
+        # =============================================================
         # línkè · 跨设备状态同步（角色卡 / 预设 / 世界书 / 聊天历史）
         # 简单 key/value 表，client 用 last-write-wins 即可（单用户场景）
         # =============================================================
+        # =============================================================
+        # 玉兔玩具桥 · toy bridge
+        #   push: 克克(本机)投递指令  →  pull: 树莓派玉兔bot 取指令
+        #   指令 30s 过期；断线重连不会补发旧指令。强度上限/急停在树莓派本地。
+        # =============================================================
+        @mcp.custom_route("/api/toy/push", methods=["POST"])
+        async def api_toy_push(request):
+            """克克投递玩具指令。仅接受服务器本机直连（绕过 nginx、无转发头）。"""
+            from starlette.responses import JSONResponse
+            import time as _t
+            # 只认本机直连：经 nginx 来的都带转发头 → 拒绝
+            if request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip"):
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            host = request.client.host if request.client else ""
+            if host not in ("127.0.0.1", "::1", "localhost"):
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            try:
+                body = await request.body()
+                text = body.decode("utf-8", "ignore")
+                ctype = request.headers.get("content-type", "")
+                cmd = ""
+                if "application/json" in ctype:
+                    try:
+                        cmd = (_json_lib.loads(text or "{}").get("cmd") or "").strip()
+                    except Exception:
+                        cmd = ""
+                elif "x-www-form-urlencoded" in ctype:
+                    from urllib.parse import parse_qs
+                    cmd = (parse_qs(text).get("cmd", [""])[0]).strip()
+                else:
+                    cmd = text.strip()
+            except Exception as e:
+                return JSONResponse({"error": str(e)}, status_code=400)
+            if not cmd:
+                return JSONResponse({"error": "empty"}, status_code=400)
+            st = globals().setdefault("_TOY_STATE", {"next_id": 1, "q": []})
+            item = {"id": st["next_id"], "cmd": cmd[:200], "ts": _t.time()}
+            st["next_id"] += 1
+            st["q"].append(item)
+            cutoff = _t.time() - 60
+            st["q"] = [x for x in st["q"] if x["ts"] >= cutoff]
+            # 本地玉兔bot 在线判定：看它最近一次来取信(pull)有多久
+            #   >40s 没来 = 大概率离线/没跑，投了也没人执行 → 警告克克别误报成功
+            last_pull = st.get("last_pull", 0)
+            gap = _t.time() - last_pull if last_pull else 99999
+            online = gap <= 40
+            resp = {"ok": True, "id": item["id"], "online": online}
+            if not online:
+                resp["warn"] = (
+                    "本地玉兔bot 似乎离线（%s），指令进了信箱但玩具大概不会动。"
+                    % ("从没来取过信" if last_pull == 0 else "已 %d 秒没来取信" % int(gap))
+                )
+            return JSONResponse(resp)
+
+        @mcp.custom_route("/api/toy/pull", methods=["GET"])
+        async def api_toy_pull(request):
+            """树莓派取指令。需 ?key=TOY_PULL_KEY。长轮询≤25s，只返回最近 30s 的新指令。"""
+            from starlette.responses import JSONResponse
+            import asyncio as _a, time as _t
+            want = os.environ.get("TOY_PULL_KEY", "")
+            if not want or request.query_params.get("key", "") != want:
+                return JSONResponse({"error": "forbidden"}, status_code=403)
+            try:
+                after = int(request.query_params.get("after", "0"))
+            except Exception:
+                after = 0
+            st = globals().setdefault("_TOY_STATE", {"next_id": 1, "q": []})
+            st["last_pull"] = _t.time()  # 心跳：本地玉兔bot 还活着、在取信
+            deadline = _t.time() + 25
+            while True:
+                cutoff = _t.time() - 30
+                fresh = [x for x in st["q"] if x["id"] > after and x["ts"] >= cutoff]
+                if fresh or _t.time() >= deadline:
+                    latest = st["q"][-1]["id"] if st["q"] else after
+                    return JSONResponse({"commands": fresh, "latest": latest})
+                await _a.sleep(0.4)
+
         @mcp.custom_route("/api/state", methods=["GET"])
         async def api_state_get(request):
             """读取所有同步的 state key/value，返回 {state: {key: {value, updated_at}}}"""
@@ -3083,7 +3735,7 @@ if __name__ == "__main__":
                 _lingke_db_init(conn)
                 if conv:
                     rows = conn.execute(
-                        "SELECT id, conversation_id, role, content, created_at, error "
+                        "SELECT id, conversation_id, role, content, created_at, error, thinking "
                         "FROM messages WHERE conversation_id=? "
                         "ORDER BY created_at ASC, id ASC",
                         (conv,),
@@ -3091,7 +3743,7 @@ if __name__ == "__main__":
                 else:
                     # 没传 conv → 返回所有（兼容老前端，新前端必传）
                     rows = conn.execute(
-                        "SELECT id, conversation_id, role, content, created_at, error "
+                        "SELECT id, conversation_id, role, content, created_at, error, thinking "
                         "FROM messages ORDER BY created_at ASC, id ASC"
                     ).fetchall()
                 conn.close()
@@ -3106,6 +3758,8 @@ if __name__ == "__main__":
                     }
                     if r["error"]:
                         m["error"] = r["error"]
+                    if r["thinking"]:
+                        m["thinking"] = r["thinking"]
                     msgs.append(m)
                 return JSONResponse({"ok": True, "messages": msgs})
             except Exception as e:
@@ -3132,6 +3786,7 @@ if __name__ == "__main__":
             role = body.get("role")
             content = body.get("content", "")
             error = body.get("error")
+            thinking = body.get("thinking")  # 思考链原文（仅 assistant 有，可空）
             if not mid or not isinstance(mid, str):
                 return JSONResponse({"error": "id required"}, status_code=400)
             if role not in ("user", "assistant"):
@@ -3143,12 +3798,13 @@ if __name__ == "__main__":
                 _lingke_db_init(conn)
                 created_at = body.get("created_at") or datetime.now(timezone.utc).isoformat()
                 conn.execute(
-                    "INSERT INTO messages (id, conversation_id, role, content, created_at, error) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO messages (id, conversation_id, role, content, created_at, error, thinking) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET "
                     "conversation_id=COALESCE(excluded.conversation_id, messages.conversation_id), "
-                    "content=excluded.content, error=excluded.error",
-                    (mid, conv, role, content, created_at, error)
+                    "content=excluded.content, error=excluded.error, "
+                    "thinking=COALESCE(excluded.thinking, messages.thinking)",
+                    (mid, conv, role, content, created_at, error, thinking)
                 )
                 _lingke_touch_conv(conn, conv)
                 conn.commit()
