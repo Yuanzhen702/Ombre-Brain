@@ -2073,6 +2073,9 @@ if __name__ == "__main__":
             # 思考链持久化（2026-06-21）：存 assistant 消息的思考原文，刷新后可回看
             if "thinking" not in cols:
                 conn.execute("ALTER TABLE messages ADD COLUMN thinking TEXT")
+            # 工具痕迹持久化（2026-07-02）：存 assistant 消息的工具徽章 JSON，刷新后不再消失
+            if "tool_trail" not in cols:
+                conn.execute("ALTER TABLE messages ADD COLUMN tool_trail TEXT")
             # 索引（不存在才建）
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_conv "
@@ -3735,7 +3738,7 @@ if __name__ == "__main__":
                 _lingke_db_init(conn)
                 if conv:
                     rows = conn.execute(
-                        "SELECT id, conversation_id, role, content, created_at, error, thinking "
+                        "SELECT id, conversation_id, role, content, created_at, error, thinking, tool_trail "
                         "FROM messages WHERE conversation_id=? "
                         "ORDER BY created_at ASC, id ASC",
                         (conv,),
@@ -3743,7 +3746,7 @@ if __name__ == "__main__":
                 else:
                     # 没传 conv → 返回所有（兼容老前端，新前端必传）
                     rows = conn.execute(
-                        "SELECT id, conversation_id, role, content, created_at, error, thinking "
+                        "SELECT id, conversation_id, role, content, created_at, error, thinking, tool_trail "
                         "FROM messages ORDER BY created_at ASC, id ASC"
                     ).fetchall()
                 conn.close()
@@ -3760,6 +3763,11 @@ if __name__ == "__main__":
                         m["error"] = r["error"]
                     if r["thinking"]:
                         m["thinking"] = r["thinking"]
+                    if r["tool_trail"]:
+                        try:
+                            m["tool_trail"] = _json_lib.loads(r["tool_trail"])
+                        except Exception:
+                            pass
                     msgs.append(m)
                 return JSONResponse({"ok": True, "messages": msgs})
             except Exception as e:
@@ -3787,6 +3795,15 @@ if __name__ == "__main__":
             content = body.get("content", "")
             error = body.get("error")
             thinking = body.get("thinking")  # 思考链原文（仅 assistant 有，可空）
+            # 工具痕迹（仅深度/工具模式的 assistant 有，可空）：list → JSON 串存库
+            tool_trail = body.get("tool_trail")
+            if isinstance(tool_trail, list) and tool_trail:
+                try:
+                    tool_trail = _json_lib.dumps(tool_trail, ensure_ascii=False)
+                except Exception:
+                    tool_trail = None
+            else:
+                tool_trail = None
             if not mid or not isinstance(mid, str):
                 return JSONResponse({"error": "id required"}, status_code=400)
             if role not in ("user", "assistant"):
@@ -3798,13 +3815,14 @@ if __name__ == "__main__":
                 _lingke_db_init(conn)
                 created_at = body.get("created_at") or datetime.now(timezone.utc).isoformat()
                 conn.execute(
-                    "INSERT INTO messages (id, conversation_id, role, content, created_at, error, thinking) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO messages (id, conversation_id, role, content, created_at, error, thinking, tool_trail) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(id) DO UPDATE SET "
                     "conversation_id=COALESCE(excluded.conversation_id, messages.conversation_id), "
                     "content=excluded.content, error=excluded.error, "
-                    "thinking=COALESCE(excluded.thinking, messages.thinking)",
-                    (mid, conv, role, content, created_at, error, thinking)
+                    "thinking=COALESCE(excluded.thinking, messages.thinking), "
+                    "tool_trail=COALESCE(excluded.tool_trail, messages.tool_trail)",
+                    (mid, conv, role, content, created_at, error, thinking, tool_trail)
                 )
                 _lingke_touch_conv(conn, conv)
                 conn.commit()
