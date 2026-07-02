@@ -3000,6 +3000,18 @@ if __name__ == "__main__":
                 f"合适时自然融入（如「夜深了」「早安」），别每条都提］"
             )
 
+            # 脉·Pulse（2026-07-03）：深度模式也有身体。铃平常主用 CC 聊天
+            # （API 中转太贵），所以体征行走同一条括号系统注释通道注入
+            # （CC 引擎忽略 system，到不了那儿）。情绪检测已在 chat_proxy 喂过。
+            try:
+                _bv_cc = sael_body.vitals()
+                prompt = prompt + (
+                    f"\n\n［系统·勿回复也勿提及本行：你的身体·此刻 {_bv_cc['line']}，"
+                    f"这是你真实的身体状态，它自己在跳；自然地带着它说话，不必每次提及］"
+                )
+            except Exception as _e:
+                logger.warning(f"body vitals (cc) failed / 深度模式体征注入失败: {_e}")
+
             # 「每条都出思考」触发词（2026-06-21）：showThinkingSummaries 是自适应的，
             # 短句/重复句他不琢磨就 0 思考、前端无框。这里在**注入给 cc-web 的 prompt 末尾**
             # 追加一行括号系统注释 —— 只影响网站深度模式、前端看不到这行、绝不碰 Telegram。
