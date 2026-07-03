@@ -1397,6 +1397,19 @@ async def api_body(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/body/murmur", methods=["GET"])
+async def api_body_murmur(request):
+    """此刻的碎碎念（二期，2026-07-03）。前端 8s 轮询；45-100s 才换一句。"""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+    try:
+        return JSONResponse(sael_body.murmur())
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/body/beat", methods=["POST"])
 async def api_body_beat(request):
     """TG 侧心搏口（脉·Pulse 三期，2026-07-03）：仅限本机调用。
