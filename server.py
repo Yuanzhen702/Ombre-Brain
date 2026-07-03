@@ -1399,12 +1399,24 @@ async def api_body(request):
 
 @mcp.custom_route("/api/body/murmur", methods=["GET"])
 async def api_body_murmur(request):
-    """此刻的碎碎念（二期，2026-07-03）。前端 8s 轮询；45-100s 才换一句。"""
+    """此刻的碎碎念（二期，2026-07-03）。前端 8s 轮询；45-100s 才换一句。
+    普鲁斯特钩子：嗅/味刚被实体词点亮时，先去记忆桶捞一条旧记忆当回声。"""
     from starlette.responses import JSONResponse
     err = _require_auth(request)
     if err:
         return err
     try:
+        entity = sael_body.pop_proust()
+        if entity:
+            try:
+                hits = await bucket_mgr.search(entity, limit=1)
+            except Exception:
+                hits = []
+            if hits:
+                frag = strip_wikilinks(hits[0].get("content", "")).replace("\n", " ")[:56]
+                text = f"{entity}……想起来了。{frag}…"
+                sael_body.pin_murmur(text)
+                return JSONResponse({"text": text, "ts": int(time.time()), "proust": True})
         return JSONResponse(sael_body.murmur())
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

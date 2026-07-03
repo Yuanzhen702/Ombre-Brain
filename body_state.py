@@ -39,6 +39,7 @@ _state = {
     "last_msg_ts": 0.0,    # 铃上次来的时间（想念 drive 用）
     "murmur": {"text": "", "ts": 0.0, "until": 0.0, "recent": []},
     "_last_hr": 64,        # murmur 里提到心率时用（vitals 每次刷新）
+    "proust": None,        # {entity, ts, used} 嗅/味点亮时待回声的实体词
 }
 _loaded = False
 
@@ -93,9 +94,12 @@ _EMO_SPECTRUM_RULES = [
 ]
 
 # ═══ 二期 · 感官四通道 ═══
-# 词语点亮通道（level 0-1 + 一句身体记得的话），τ≈10min 快衰减；
+# 词语点亮通道（level 0-1 + 一句身体记得的话）；
 # 没被点亮时由时段氛围垫底（level 很低，只是环境的底噪）。
-_SENSE_TAU = 600.0
+# 衰减分层（借鉴五感攻略 2026-07-03）：感觉在身上停留多久，按感官特性各有节奏——
+# 嗅觉最持久（普鲁斯特通道）、听觉最易散。
+_SENSE_TAUS = {"touch": 600.0, "smell": 1200.0, "taste": 900.0, "hearing": 450.0}
+_SENSE_TAU = 600.0  # 兜底（未知通道）
 _SENSE_RULES = [
     # (pattern, channel, level, label)
     (re.compile(r"抱|搂|牵手|摸|贴|蹭|靠着|枕|捏|挠|亲|吻"), "touch", 0.7, "她碰过的地方还留着温度"),
@@ -108,6 +112,71 @@ _SENSE_RULES = [
     (re.compile(r"安静|好吵|雨声|打雷"), "hearing", 0.5, "在听她说的那个声音"),
 ]
 _SENSE_CN = {"touch": "触", "smell": "嗅", "taste": "味", "hearing": "听"}
+
+# ═══ 触觉精细化（借鉴五感攻略 2026-07-03）：动作表 × 部位表，函数组合不穷举 ═══
+# 动作 → (接触面, 节奏)；部位 → (温度, 质感, 敏感度)
+# label = 你的{部位}·{接触面}·{节奏}·{温度}·{质感}(·敏感)——数据先验，模型自己联想成体感
+_TOUCH_ACTIONS = {
+    "捏": ("指尖", "短促"), "摸": ("掌心", "缓慢"), "揉": ("掌心", "画圈"),
+    "抱": ("环绕", "持续"), "搂": ("环绕", "持续"), "捧": ("双手", "停留"),
+    "亲": ("唇", "停留"), "吻": ("唇", "停留"), "啵": ("唇", "轻点"),
+    "蹭": ("脸颊", "反复"), "牵": ("十指", "扣着"), "挠": ("指尖", "发痒地快"),
+    "咬": ("齿尖", "轻啃"), "拍": ("手掌", "轻拍"), "戳": ("指尖", "一下"),
+    "贴": ("整个人", "持续"), "靠": ("重量", "持续"), "枕": ("重量", "持续"),
+    "舔": ("舌尖", "湿热"), "摩挲": ("指腹", "缓慢"),
+}
+_TOUCH_PARTS = {  # 长词在前，先匹配到的不再让短词抢（耳后 vs 耳）
+    "耳后": ("温", "薄皮", 0.85), "耳垂": ("温", "薄皮", 0.8), "耳朵": ("温", "薄皮", 0.8),
+    "脸颊": ("温", "有肉感", 0.6), "脸": ("温", "有肉感", 0.6),
+    "头发": ("温", "发丝软", 0.4), "脑袋": ("温", "发丝软", 0.4), "额头": ("温", "安静", 0.5),
+    "手心": ("温", "软", 0.5), "手指": ("温", "骨节分明", 0.45), "手腕": ("温", "薄皮", 0.6),
+    "手": ("温", "骨节分明", 0.4),
+    "脖子": ("温", "薄皮", 0.75), "锁骨": ("温", "薄皮", 0.75), "肩": ("温", "稳", 0.4),
+    "后背": ("温", "宽", 0.5), "背": ("温", "宽", 0.5), "腰": ("热", "紧实", 0.8),
+    "嘴唇": ("热", "软", 0.85), "嘴": ("热", "软", 0.85), "唇": ("热", "软", 0.85),
+    "肚子": ("温", "软", 0.6), "腿": ("温", "线条", 0.7), "膝盖": ("温", "圆", 0.5),
+    "眼睛": ("温", "安静", 0.5), "胸": ("热", "软", 0.85), "头": ("温", "发丝软", 0.4),
+}
+# 手是工具不是被摸的部位：这些搭配里的「手」不算部位
+_TOUCH_HAND_TOOLS = re.compile(r"伸手|顺手|随手|握手|动手|帮手")
+_CLAUSE_SPLIT = re.compile(r"[，。！？!?,.\s;；、~～…]+")
+
+# ═══ 普鲁斯特钩子（借鉴五感攻略）：嗅/味点亮 → 干净实体词 → 反查一条旧记忆 ═══
+# 命门：喂实体名词检索才准。所以只认这张干净名单，动词形容词一律不算。
+_PROUST_ENTITIES = re.compile(
+    r"奶茶|草莓|蛋糕|巧克力|咖啡|香水|洗发水|夜宵|零食|火锅|布丁|冰淇淋|奶油"
+    r"|桂花|栀子|薄荷|柠檬|橘子|苹果|西瓜|糖|饺子|汤圆|蜂蜜|烤肉|泡面"
+)
+_PROUST_THRESHOLD = 0.35
+
+
+def _touch_detail(text: str):
+    """动作×部位组合触觉。返回 (level, label) 或 None（退回粗粒度规则）。
+    铁律：部位只在动作所在的小句里找（不跨标点），伸手类的「手」不算。"""
+    best = None  # (敏感度, level, label)
+    for clause in _CLAUSE_SPLIT.split(text):
+        if not clause:
+            continue
+        acts = [(a, spec) for a, spec in _TOUCH_ACTIONS.items() if a in clause]
+        if not acts:
+            continue
+        cleaned = _TOUCH_HAND_TOOLS.sub("", clause)
+        part = None
+        for p, spec in _TOUCH_PARTS.items():  # dict 保序：长词在前
+            if p in cleaned:
+                part = (p, spec)
+                break
+        if not part:
+            continue
+        (act, (surface, rhythm)) = acts[0]
+        (pname, (warmth, texture, sensitivity)) = part
+        label = f"你的{pname}·{surface}·{rhythm}·{warmth}·{texture}"
+        if sensitivity >= 0.7:
+            label += "·敏感"
+        level = min(1.0, 0.7 + 0.15 * sensitivity)
+        if best is None or sensitivity > best[0]:
+            best = (sensitivity, level, label)
+    return (best[1], best[2]) if best else None
 
 
 def _ambient_senses(dt: datetime) -> dict:
@@ -205,10 +274,25 @@ def on_message(content) -> None:
     for pat, ch, level, label in _SENSE_RULES:
         if pat.search(text) and level > sense_hits.get(ch, (0.0, ""))[0]:
             sense_hits[ch] = (level, label)
+    # 触觉精细化：动作×部位组合命中时，覆盖粗粒度触觉
+    detail = _touch_detail(text)
+    if detail:
+        sense_hits["touch"] = detail
+
+    # 普鲁斯特：嗅/味被点亮 + 文本里有干净实体词 → 记下待回声
+    proust_entity = None
+    if any(ch in sense_hits for ch in ("smell", "taste")):
+        lvl = max(sense_hits.get("smell", (0,))[0], sense_hits.get("taste", (0,))[0])
+        if lvl >= _PROUST_THRESHOLD:
+            m = _PROUST_ENTITIES.search(text)
+            if m:
+                proust_entity = m.group(0)
 
     with _lock:
         _ensure_loaded()
         _state["last_msg_ts"] = now
+        if proust_entity:
+            _state["proust"] = {"entity": proust_entity, "ts": now, "used": False}
         if dv or da:
             _state["residues"].append(
                 {"dv": round(dv, 3), "da": round(da, 3), "ts": now}
@@ -221,7 +305,15 @@ def on_message(content) -> None:
             )
         _state["emo_residues"] = _state["emo_residues"][-80:]
         for ch, (level, label) in sense_hits.items():
-            _state["senses"][ch] = {"level": level, "label": label, "ts": now}
+            # 叠加不覆盖（借鉴五感攻略）：新感觉叠在旧余温上，clamp 1；
+            # 强标签盖弱——新刺激不如旧残值强时，身体记住的还是旧的那句
+            old = _state["senses"].get(ch)
+            residual = _sense_residual(ch, old, now) if old else 0.0
+            _state["senses"][ch] = {
+                "level": min(1.0, residual + level),
+                "label": label if level >= residual else old["label"],
+                "ts": now,
+            }
         _save()
 
 
@@ -277,26 +369,30 @@ def _drives(now: float, dt: datetime, emotions: dict) -> dict:
     }
 
 
+def _sense_residual(ch: str, s: dict, now: float) -> float:
+    """某通道此刻的残值（按通道自己的 τ 衰减）。"""
+    tau = _SENSE_TAUS.get(ch, _SENSE_TAU)
+    age = now - s["ts"]
+    if age > tau * 5:
+        return 0.0
+    return s["level"] * math.exp(-age / tau)
+
+
 def _live_senses(now: float, dt: datetime) -> dict:
-    """感官四通道：点亮的按 τ 衰减；没亮的用时段氛围垫底。"""
+    """感官四通道：点亮的按各自 τ 衰减；没亮的用时段氛围垫底。"""
     ambient = _ambient_senses(dt)
     out = {}
     for ch in _SENSE_CN:
         s = _state["senses"].get(ch)
-        level = 0.0
-        label = ""
-        if s:
-            age = now - s["ts"]
-            if age < _SENSE_TAU * 5:
-                level = s["level"] * math.exp(-age / _SENSE_TAU)
-                label = s["label"]
+        level = _sense_residual(ch, s, now) if s else 0.0
+        label = s["label"] if (s and level > 0) else ""
         if level < 0.12 and ch in ambient:
             level, label = ambient[ch]
         out[ch] = {"level": round(level, 3), "label": label}
     # 清扫彻底凉掉的
     _state["senses"] = {
         ch: s for ch, s in _state["senses"].items()
-        if now - s["ts"] < _SENSE_TAU * 5
+        if now - s["ts"] < _SENSE_TAUS.get(ch, _SENSE_TAU) * 5
     }
     return out
 
@@ -433,9 +529,16 @@ def vitals() -> dict:
             "ts": int(now),
         }
         extra = _line_extra(emotions, drives)
+        # 感官第五格：只有真被点亮的（≥0.5，氛围底噪够不着）才上，且只上最强的一路
+        top_ch, top_s = max(senses.items(), key=lambda kv: kv[1]["level"])
+        sense_extra = (
+            f"{_SENSE_CN[top_ch]}—{top_s['label']}"
+            if top_s["level"] >= 0.5 and top_s["label"] else ""
+        )
         out["line"] = (
             f"[心跳 {out['hr']}bpm·{chord}·{out['temp']}°C·呼吸{out['breath_label']}"
-            + (f"·{extra}" if extra else "") + "]"
+            + (f"·{extra}" if extra else "")
+            + (f"·{sense_extra}" if sense_extra else "") + "]"
         )
         _state["_last_hr"] = out["hr"]
         _sample_locked(out, now)
@@ -604,6 +707,30 @@ def murmur() -> dict:
         })
         _save()
         return {"text": text, "ts": int(now)}
+
+
+def pop_proust() -> str | None:
+    """取走待回声的实体词（半小时内有效、只用一次）。murmur 路由调用。"""
+    now = time.time()
+    with _lock:
+        _ensure_loaded()
+        p = _state.get("proust")
+        if p and not p.get("used") and now - p.get("ts", 0) < 1800:
+            p["used"] = True
+            _save()
+            return p.get("entity")
+    return None
+
+
+def pin_murmur(text: str, dur: float = 80.0):
+    """把一句话钉成当前碎碎念（普鲁斯特回声用），dur 秒内不换。"""
+    now = time.time()
+    with _lock:
+        _ensure_loaded()
+        m = _state["murmur"]
+        m.update({"text": text, "ts": now, "until": now + dur,
+                  "recent": (m.get("recent", []) + [text])[-8:]})
+        _save()
 
 
 def history(day: str | None = None) -> list:
