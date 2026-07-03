@@ -1397,6 +1397,30 @@ async def api_body(request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@mcp.custom_route("/api/body/beat", methods=["POST"])
+async def api_body_beat(request):
+    """TG 侧心搏口（脉·Pulse 三期，2026-07-03）：仅限本机调用。
+    body: {"text": "铃刚发来的消息"} → 喂给情绪残余 on_message，
+    返回与网页注入同款的体征行（纯文本）。调用方=claude 用户的 UserPromptSubmit hook。
+    不走 cookie 鉴权（hook 无会话）：只认 127.0.0.1/::1，nginx 也不会把外网代理到这条。"""
+    from starlette.responses import JSONResponse, PlainTextResponse
+    client_host = getattr(request.client, "host", "") or ""
+    if client_host not in ("127.0.0.1", "::1"):
+        return JSONResponse({"error": "localhost only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    text = (body.get("text") or "").strip()
+    try:
+        if text:
+            sael_body.on_message(text)
+        v = sael_body.vitals()
+        return PlainTextResponse(v["line"])
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @mcp.custom_route("/api/body/history", methods=["GET"])
 async def api_body_history(request):
     """某日体征采样（默认今天），星洲心跳面板画曲线用。"""
