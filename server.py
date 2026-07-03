@@ -1500,6 +1500,45 @@ def _keke_mem_meta(path: str) -> dict:
     }
 
 
+@mcp.custom_route("/marginalia/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def marginalia_proxy(request):
+    """共读书房 Anno（2026-07-03，和铃共读）：登录墙后反代本机 3300。
+    anno 自身零鉴权、只听 127.0.0.1；对外唯一入口是这里（cookie 会话），
+    /marginalia/mcp 不代理（克克走本机+token）。静态三件套直接发文件。"""
+    from starlette.responses import JSONResponse, FileResponse, Response
+    err = _require_auth(request)
+    if err:
+        return err
+    path = request.path_params.get("path", "")
+    if request.method == "GET":
+        static_map = {"": "index.html", "index.html": "index.html",
+                      "anno.css": "anno.css", "anno.js": "anno.js"}
+        if path in static_map:
+            return FileResponse(f"/opt/anno/client/{static_map[path]}")
+    if not path.startswith("api/"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    try:
+        headers = {}
+        if "content-type" in request.headers:
+            headers["content-type"] = request.headers["content-type"]
+        body = await request.body()
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            r = await client.request(
+                request.method,
+                f"http://127.0.0.1:3300/{path}",
+                params=dict(request.query_params),
+                content=body if body else None,
+                headers=headers,
+            )
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            media_type=r.headers.get("content-type", "application/json"),
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=502)
+
+
 @mcp.custom_route("/api/keke-memory", methods=["GET"])
 async def api_keke_memory(request):
     """列出克克的记忆（MEMORY.md 索引除外），按最近改动排序。"""
