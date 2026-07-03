@@ -1512,7 +1512,10 @@ async def marginalia_proxy(request):
     path = request.path_params.get("path", "")
     if request.method == "GET":
         static_map = {"": "index.html", "index.html": "index.html",
-                      "anno.css": "anno.css", "anno.js": "anno.js"}
+                      "anno.css": "anno.css", "anno.js": "anno.js",
+                      "lingke-tokens.css": "lingke-tokens.css",
+                      "lingke-skin.css": "lingke-skin.css",
+                      "lingke-bridge.js": "lingke-bridge.js"}
         if path in static_map:
             return FileResponse(f"/opt/anno/client/{static_map[path]}")
     if not path.startswith("api/"):
