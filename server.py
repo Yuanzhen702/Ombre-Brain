@@ -124,12 +124,39 @@ async def _dehydrate_one(bucket, clean_meta):
         return bucket, None
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
-# host="0.0.0.0" so Docker container's SSE is externally reachable
-# stdio mode ignores host (no network)
+# 🔒 绑定地址（2026-07-04 安全体检）：本部署=裸机 systemd + nginx 前置，MCP 工具无鉴权，
+#    绝不能让 8000 直接暴露公网（否则可绕过 nginx 的 /mcp 白名单直连裸端口）。默认绑 127.0.0.1，
+#    只允许本机 nginx 反代访问。若日后真的搬进 Docker 需要外部可达，设 OMBRE_BIND_HOST=0.0.0.0。
+#    stdio 模式忽略 host（无网络）。
+_BIND_HOST = os.environ.get("OMBRE_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+
+# 🔐 OAuth（2026-07-04）：claude.ai 现在给新加的远程 MCP 连接器强制 OAuth。用 SDK 内置能力 +
+#    自定义 provider（oauth_provider.py，SQLite 持久化、自动放行）补上，让铃能重新添加连接器。
+#    真正的访问边界仍是 nginx 对 /mcp 的 IP 白名单；OAuth 令牌是第二层。详见 oauth_provider.py。
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.server.transport_security import TransportSecuritySettings
+from oauth_provider import SqliteOAuthProvider
+
+_OAUTH_ISSUER = (os.environ.get("OMBRE_OAUTH_ISSUER", "https://lingke.bond").rstrip("/"))
 mcp = FastMCP(
     "Ombre Brain",
-    host="0.0.0.0",
+    host=_BIND_HOST,
     port=OMBRE_PORT,
+    # 关掉 MCP 传输层的 DNS 重绑定防护（2026-07-04）：它默认只信 127.0.0.1，会把经 nginx 反代
+    #   传来的真实 Host「lingke.bond」判为可疑 → 421 Misdirected Request（claude.ai OAuth 通过后
+    #   死在这一步）。此防护是防「浏览器恶意站点偷连本地 MCP」，而我们的 /mcp 已被 IP 白名单锁死
+    #   （仅 Anthropic 段可达）、不存在浏览器直连场景，故关闭安全无虞；真正边界是 IP 白名单+OAuth。
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+    auth_server_provider=SqliteOAuthProvider(),
+    auth=AuthSettings(
+        issuer_url=_OAUTH_ISSUER,
+        resource_server_url=_OAUTH_ISSUER + "/mcp",
+        client_registration_options=ClientRegistrationOptions(
+            enabled=True, valid_scopes=["user"], default_scopes=["user"]
+        ),
+        revocation_options=RevocationOptions(enabled=True),
+        required_scopes=[],
+    ),
 )
 
 
@@ -3694,6 +3721,120 @@ if __name__ == "__main__":
             return JSONResponse({"ok": True, "message": {"role": "assistant", "content": reply_text}, "usage": data.get("usage", {}), "model": data.get("model"), "stop_reason": data.get("stop_reason")})
 
 
+        # ─────────────────────────────────────────────────────────
+        # 深度模式·后端 CC 模型切换（2026-07-04）
+        #   聊天页迷你顶条/深度区 POST 一个官方模型 → 写 .cc-web.env，
+        #   再用同一把 cc-web 锁重启常驻会话（start.sh 会 --resume 同一 SID，
+        #   上下文不丢）。白名单只放确认可用的模型，避免把无效 --model 传给
+        #   CLI 拖垮深度模式；起不来自动回滚到原模型。
+        # ─────────────────────────────────────────────────────────
+        _CC_WEB_ENV_FILE = "/home/claude/.cc-web.env"
+        _CC_WEB_START_SH = "/home/claude/cc-web-start.sh"
+        _CC_WEB_DEFAULT_MODEL = "claude-opus-4-8"
+        # value 直接作为 `claude --model <value>` 的参数；label/note 给前端显示。
+        _CC_WEB_MODEL_OPTIONS = [
+            {"value": "claude-opus-4-8", "label": "Opus 4.8", "note": "最强 · 深度活儿"},
+            {"value": "claude-opus-4-7", "label": "Opus 4.7", "note": "强 · 均衡"},
+            {"value": "sonnet", "label": "Sonnet", "note": "轻快 · 省额度"},
+        ]
+        _CC_WEB_MODEL_VALUES = {o["value"] for o in _CC_WEB_MODEL_OPTIONS}
+
+        def _cc_web_read_model():
+            try:
+                with open(_CC_WEB_ENV_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("CC_WEB_MODEL="):
+                            return line.split("=", 1)[1].strip() or _CC_WEB_DEFAULT_MODEL
+            except Exception:
+                pass
+            return _CC_WEB_DEFAULT_MODEL
+
+        def _cc_web_write_model(value):
+            # 文件里只有 CC_WEB_MODEL 一行，整份重写最省事；写完 chown 回 claude。
+            with open(_CC_WEB_ENV_FILE, "w", encoding="utf-8") as f:
+                f.write(f"CC_WEB_MODEL={value}\n")
+            try:
+                import pwd
+                pw = pwd.getpwnam("claude")
+                os.chown(_CC_WEB_ENV_FILE, pw.pw_uid, pw.pw_gid)
+            except Exception:
+                pass
+
+        @mcp.custom_route("/api/cc-model", methods=["GET"])
+        async def api_cc_model_get(request):
+            """当前深度模式后端模型 + 可选官方模型列表。"""
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            return JSONResponse({
+                "model": _cc_web_read_model(),
+                "options": _CC_WEB_MODEL_OPTIONS,
+            })
+
+        @mcp.custom_route("/api/cc-model", methods=["POST"])
+        async def api_cc_model_set(request):
+            """切换深度模式后端模型：写 env + 重启常驻会话（保上下文）。"""
+            import asyncio as _asyncio
+            from starlette.responses import JSONResponse
+            err = _require_auth(request)
+            if err:
+                return err
+            try:
+                body = await request.json()
+            except Exception:
+                return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+            value = (body.get("model") or "").strip()
+            if value not in _CC_WEB_MODEL_VALUES:
+                return JSONResponse({"error": "unknown model"}, status_code=400)
+            prev = _cc_web_read_model()
+            if value == prev:
+                return JSONResponse({"ok": True, "model": value, "unchanged": True})
+
+            async def _run(*cmd):
+                p = await _asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                )
+                await p.communicate()
+                return p.returncode
+
+            # 复用 cc-web 锁：绝不在某轮回复流式进行时重启会话
+            lock = _cc_web_lock_holder.get("lock")
+            if lock is None:
+                lock = _asyncio.Lock()
+                _cc_web_lock_holder["lock"] = lock
+            async with lock:
+                try:
+                    _cc_web_write_model(value)
+                except Exception as e:
+                    return JSONResponse({"error": f"write env failed: {e}"}, status_code=500)
+                # start.sh 会 kill 旧会话 + --resume 同一 SID 重起，上下文不丢
+                await _run("sudo", "-H", "-u", "claude", "bash", _CC_WEB_START_SH)
+                booted = False
+                for _ in range(15):
+                    await _asyncio.sleep(1)
+                    rc = await _run("sudo", "-H", "-u", "claude", "tmux",
+                                    "has-session", "-t", "cc-web")
+                    if rc == 0:
+                        booted = True
+                        break
+                if not booted:
+                    # 起不来就回滚，别让深度模式卡在一个坏模型上
+                    try:
+                        _cc_web_write_model(prev)
+                        await _run("sudo", "-H", "-u", "claude", "bash", _CC_WEB_START_SH)
+                    except Exception:
+                        pass
+                    return JSONResponse(
+                        {"error": "切换后会话没起来，已回退到原模型"}, status_code=500)
+                await _asyncio.sleep(3)  # 给 TUI 起好再放行，避免紧接着的消息注入落空
+            logger.info(f"[cc-web] model switched {prev} -> {value}")
+            return JSONResponse({"ok": True, "model": value})
+
+
         @mcp.custom_route("/api/bucket", methods=["POST"])
         async def create_bucket(request):
             """写入一条 dynamic 记忆桶（日记 / 用户写入）。走 _merge_or_create：相似旧桶自动合并。"""
@@ -4397,6 +4538,6 @@ if __name__ == "__main__":
         # (the /health route calls ensure_started; this Starlette version has no
         #  add_event_handler, and FastMCP owns the lifespan)
         # 注：衰减引擎的开机唤醒由 systemd ExecStartPost 请求 /health 完成
-        uvicorn.run(_app, host="0.0.0.0", port=OMBRE_PORT)
+        uvicorn.run(_app, host=_BIND_HOST, port=OMBRE_PORT)  # 🔒 默认 127.0.0.1，见文件顶部 _BIND_HOST 注释
     else:
         mcp.run(transport=transport)
