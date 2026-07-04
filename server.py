@@ -3732,10 +3732,13 @@ if __name__ == "__main__":
         _CC_WEB_START_SH = "/home/claude/cc-web-start.sh"
         _CC_WEB_DEFAULT_MODEL = "claude-opus-4-8"
         # value 直接作为 `claude --model <value>` 的参数；label/note 给前端显示。
+        # 都写死明确版本（别用 sonnet/opus 别名，免得看不出是哪代——CLI 2.1.x
+        # 里 sonnet=claude-sonnet-5、opus=claude-opus-4-8）。
         _CC_WEB_MODEL_OPTIONS = [
             {"value": "claude-opus-4-8", "label": "Opus 4.8", "note": "最强 · 深度活儿"},
-            {"value": "claude-opus-4-7", "label": "Opus 4.7", "note": "强 · 均衡"},
-            {"value": "sonnet", "label": "Sonnet", "note": "轻快 · 省额度"},
+            {"value": "claude-opus-4-7", "label": "Opus 4.7", "note": "强"},
+            {"value": "claude-opus-4-6", "label": "Opus 4.6", "note": "均衡"},
+            {"value": "claude-sonnet-5", "label": "Sonnet 5", "note": "轻快 · 省额度（近 Opus 质量）"},
         ]
         _CC_WEB_MODEL_VALUES = {o["value"] for o in _CC_WEB_MODEL_OPTIONS}
 
