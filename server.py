@@ -1492,6 +1492,103 @@ async def api_body_history(request):
 
 
 # =============================================================
+# 克克的额度（2026-07-09）：直接问 Anthropic 官方口，不自算。
+# 网页克克跑在 claude 用户下（headless CC），消耗的是 claude 那本账，
+# 所以读 /home/claude/.claude/.credentials.json 里的 oauth accessToken。
+# 撞额度=克克答不上话，所以这本账才是铃真正关心的。
+# 前端小组件每分钟拉一次 /api/ratelimit；这里缓存 ~50s 挡一挡官方口。
+# =============================================================
+_RL_CRED_PATH = "/home/claude/.claude/.credentials.json"
+_RL_URL = "https://api.anthropic.com/api/oauth/usage"
+_RL_TTL = 50  # 秒
+_rl_cache = {"ts": 0.0, "data": None}
+
+
+def _rl_read_token():
+    """现读凭据取 accessToken（Claude Code 会自己续期，所以每次读最新的）。"""
+    try:
+        with open(_RL_CRED_PATH, "r", encoding="utf-8") as f:
+            return _json_lib.load(f)["claudeAiOauth"]["accessToken"]
+    except Exception:
+        return None
+
+
+def _rl_slot(d):
+    """把官方一个额度槽整理成 {percent, resets_at}；缺就返回 None。"""
+    if not isinstance(d, dict):
+        return None
+    pct = d.get("utilization")
+    return {
+        "percent": round(pct) if isinstance(pct, (int, float)) else None,
+        "resets_at": d.get("resets_at"),
+    }
+
+
+@mcp.custom_route("/api/ratelimit", methods=["GET"])
+async def api_ratelimit(request):
+    """网页克克账号的当前用量（5小时 / 本周），问 Anthropic 官方口。"""
+    from starlette.responses import JSONResponse
+    err = _require_auth(request)
+    if err:
+        return err
+
+    now = time.time()
+    if _rl_cache["data"] is not None and now - _rl_cache["ts"] < _RL_TTL:
+        return JSONResponse(_rl_cache["data"])
+
+    token = _rl_read_token()
+    if not token:
+        return JSONResponse(
+            {"error": "no_token", "detail": "读不到 Claude Code 登录凭据"},
+            status_code=503,
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(
+                _RL_URL,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                },
+            )
+    except Exception as e:
+        # 网络抖了：有旧缓存就返回旧的（标 stale），别让面板整块空掉
+        if _rl_cache["data"] is not None:
+            stale = dict(_rl_cache["data"])
+            stale["stale"] = True
+            return JSONResponse(stale)
+        return JSONResponse({"error": "fetch_failed", "detail": str(e)}, status_code=502)
+
+    if r.status_code == 401:
+        return JSONResponse(
+            {"error": "token_expired", "detail": "登录凭据过期，需在服务器重登 Claude Code"},
+            status_code=401,
+        )
+    if r.status_code != 200:
+        return JSONResponse({"error": "upstream", "status": r.status_code}, status_code=502)
+
+    raw = r.json()
+    # 顶格严重度：官方 limits[] 里当前 active 的最高档（normal<warning<critical）
+    _rank = {"normal": 0, "warning": 1, "critical": 2}
+    sev = "normal"
+    for lim in raw.get("limits") or []:
+        s = lim.get("severity")
+        if lim.get("is_active") and _rank.get(s, 0) > _rank[sev]:
+            sev = s
+    out = {
+        "five_hour": _rl_slot(raw.get("five_hour")),
+        "seven_day": _rl_slot(raw.get("seven_day")),
+        "seven_day_opus": _rl_slot(raw.get("seven_day_opus")),
+        "severity": sev,
+        "fetched_at": int(now),
+    }
+    _rl_cache["ts"] = now
+    _rl_cache["data"] = out
+    return JSONResponse(out)
+
+
+# =============================================================
 # 克克的小本本（2026-07-03）：TG 那边的 CC 在聊天中自己写下的记忆
 # （/home/claude/.claude/projects/-home-claude/memory/ 的 .md）。
 # 铃想在手机上翻 → 只读暴露给前端（星洲「慢慢逛」入口）。绝不提供写接口。
