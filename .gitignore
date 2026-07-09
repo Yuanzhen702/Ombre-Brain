@@ -10,6 +10,8 @@ embeddings.db
 embeddings.db-*
 dehydration_cache.db
 dehydration_cache.db-*
+oauth.db
+oauth.db-*
 .sessions.json
 dream.log
 *.log
